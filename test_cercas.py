@@ -7,6 +7,7 @@ import os
 import pytest
 
 from cercas_v2 import (
+    _COSTURA_DIST_MAX_M,
     _costura_ways,
     _haversine_m,
     _montar_codigo,
@@ -71,17 +72,48 @@ def test_utm_epsg_norte():
 def test_costura_sequencial():
     nodes = {1: (0.0, 0.0), 2: (1.0, 0.0), 3: (2.0, 0.0)}
     ways  = [{"nodes": [1, 2]}, {"nodes": [2, 3]}]
-    assert _costura_ways(ways, nodes) == [1, 2, 3]
+    assert _costura_ways(ways, nodes) == [[1, 2, 3]]
 
 def test_costura_reverso():
     nodes = {1: (0.0, 0.0), 2: (1.0, 0.0), 3: (2.0, 0.0)}
     ways  = [{"nodes": [1, 2]}, {"nodes": [3, 2]}]
-    assert _costura_ways(ways, nodes) == [1, 2, 3]
+    assert _costura_ways(ways, nodes) == [[1, 2, 3]]
 
 def test_costura_no_ausente():
     nodes = {1: (0.0, 0.0)}
     ways  = [{"nodes": [1, 99]}]  # nó 99 não existe
     assert _costura_ways(ways, nodes) == []
+
+def test_costura_componentes_desconexos():
+    # Dois trechos sem nó em comum: a via está fragmentada no bbox. [FAT-68]
+    nodes = {1: (0.0, 0.0), 2: (1.0, 0.0), 3: (2.0, 0.0),
+             10: (50.0, 50.0), 11: (51.0, 50.0)}
+    ways  = [{"nodes": [10, 11]}, {"nodes": [1, 2]}, {"nodes": [2, 3]}]
+    componentes = _costura_ways(ways, nodes)
+    assert {tuple(c) for c in componentes} == {(10, 11), (1, 2, 3)}
+
+def test_costura_escolhe_componente_mais_proximo():
+    # Simula a seleção feita em buscar_geometria_osm: entre dois componentes,
+    # vence o que fica perto de início/fim, mesmo não sendo o primeiro da
+    # lista original de ways.  [FAT-68, DEC-6]
+    nodes = {1: (0.0, 0.0), 2: (0.01, 0.0),           # componente longe
+             10: (-25.38, -49.19), 11: (-25.39, -49.19)}  # componente perto
+    ways  = [{"nodes": [1, 2]}, {"nodes": [10, 11]}]
+    ponto_inicio = (-25.38, -49.19)
+    ponto_fim    = (-25.39, -49.19)
+
+    componentes = _costura_ways(ways, nodes)
+    melhor = None
+    for nos in componentes:
+        coords = [nodes[n] for n in nos]
+        d_ini = min(_haversine_m(ponto_inicio, c) for c in coords)
+        d_fim = min(_haversine_m(ponto_fim, c) for c in coords)
+        if melhor is None or (d_ini + d_fim) < melhor[0]:
+            melhor = (d_ini + d_fim, nos, d_ini, d_fim)
+
+    _, nos_escolhidos, d_ini, d_fim = melhor
+    assert nos_escolhidos == [10, 11]
+    assert d_ini < _COSTURA_DIST_MAX_M and d_fim < _COSTURA_DIST_MAX_M
 
 
 # ── Módulo 4: gerar_cercas ────────────────────────────────────────────────────

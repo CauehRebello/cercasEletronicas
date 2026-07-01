@@ -154,6 +154,10 @@ def ler_lote(caminho: str) -> List[Dict[str, str]]:
 OVERPASS_URL = "https://lz4.overpass-api.de/api/interpreter"
 OVERPASS_TIMEOUT = 30
 
+# Distância máxima (m) de início/fim ao componente escolhido — 2x o buffer_m
+# padrão (50 m). Acima disso, a via encontrada não é a pedida.  [FAT-68, DEC-6]
+_COSTURA_DIST_MAX_M = 100.0
+
 
 def _haversine_m(p1: Tuple[float, float], p2: Tuple[float, float]) -> float:
     """Distância em metros entre dois pontos (lat, lon)."""
@@ -204,50 +208,56 @@ def _overpass_query(q: str) -> dict:
             )
 
 
-def _costura_ways(ways: list, nodes: dict) -> List[int]:
+def _costura_ways(ways: list, nodes: dict) -> List[List[int]]:
     """
-    Costura de ways: encadeia os ways OSM por nós compartilhados e retorna
-    a sequência ordenada de node IDs. [FAT-24]
+    Costura de ways: encadeia ways OSM por nós compartilhados.
+    Retorna TODOS os componentes conexos encontrados (cada um uma lista
+    ordenada de node IDs) — a via pode estar fragmentada em vários trechos
+    desconexos dentro do bbox de busca.  [FAT-68, DEC-6]
 
-    Algoritmo greedy:
+    Algoritmo greedy, repetido até esgotar os ways:
       1. Seleciona ways com nós conhecidos.
-      2. Inicializa a cadeia com o primeiro way.
+      2. Inicializa uma cadeia com o primeiro way restante.
       3. A cada passo, encontra o way cuja extremidade coincide com a
          extremidade atual da cadeia, revertendo-o se necessário.
+      4. Ao travar (nada mais encaixa), fecha o componente e inicia outro
+         com o que sobrou, até não restar nenhum way.
     """
     validos = [w for w in ways if all(n in nodes for n in w["nodes"])]
-    if not validos:
-        return []
-
+    componentes: List[List[int]] = []
     restantes = list(validos)
-    cadeia = [restantes.pop(0)]
 
     while restantes:
-        ultimo_no   = cadeia[-1]["nodes"][-1]
-        primeiro_no = cadeia[0]["nodes"][0]
-        encaixou = False
+        cadeia = [restantes.pop(0)]
 
-        for i, w in enumerate(restantes):
-            if w["nodes"][0] == ultimo_no:
-                cadeia.append(restantes.pop(i)); encaixou = True; break
-            elif w["nodes"][-1] == ultimo_no:
-                w["nodes"] = list(reversed(w["nodes"]))
-                cadeia.append(restantes.pop(i)); encaixou = True; break
-            elif w["nodes"][-1] == primeiro_no:
-                cadeia.insert(0, restantes.pop(i)); encaixou = True; break
-            elif w["nodes"][0] == primeiro_no:
-                w["nodes"] = list(reversed(w["nodes"]))
-                cadeia.insert(0, restantes.pop(i)); encaixou = True; break
+        while restantes:
+            ultimo_no   = cadeia[-1]["nodes"][-1]
+            primeiro_no = cadeia[0]["nodes"][0]
+            encaixou = False
 
-        if not encaixou:
-            break
+            for i, w in enumerate(restantes):
+                if w["nodes"][0] == ultimo_no:
+                    cadeia.append(restantes.pop(i)); encaixou = True; break
+                elif w["nodes"][-1] == ultimo_no:
+                    w["nodes"] = list(reversed(w["nodes"]))
+                    cadeia.append(restantes.pop(i)); encaixou = True; break
+                elif w["nodes"][-1] == primeiro_no:
+                    cadeia.insert(0, restantes.pop(i)); encaixou = True; break
+                elif w["nodes"][0] == primeiro_no:
+                    w["nodes"] = list(reversed(w["nodes"]))
+                    cadeia.insert(0, restantes.pop(i)); encaixou = True; break
 
-    nos = []
-    for w in cadeia:
-        for nid in w["nodes"]:
-            if not nos or nos[-1] != nid:
-                nos.append(nid)
-    return nos
+            if not encaixou:
+                break
+
+        nos = []
+        for w in cadeia:
+            for nid in w["nodes"]:
+                if not nos or nos[-1] != nid:
+                    nos.append(nid)
+        componentes.append(nos)
+
+    return componentes
 
 
 def buscar_geometria_osm(
@@ -297,13 +307,28 @@ out body;
     if verbose:
         print(f"  → {len(ways)} way(s) encontrado(s), {len(nodes)} nó(s).")
 
-    sequencia_nos = _costura_ways(ways, nodes)
-    if not sequencia_nos:
+    sequencias = _costura_ways(ways, nodes)
+    if not sequencias:
         if verbose:
             print("  ⚠  Costura de ways falhou.")
         return None
 
-    coords = [nodes[n] for n in sequencia_nos]
+    # Escolhe o componente mais próximo de início/fim — via pode estar
+    # fragmentada em trechos desconexos dentro da bbox.  [FAT-68, DEC-6]
+    melhor = None
+    for nos in sequencias:
+        coords_comp = [nodes[n] for n in nos]
+        d_ini = min(_haversine_m(ponto_inicio, c) for c in coords_comp)
+        d_fim = min(_haversine_m(ponto_fim, c) for c in coords_comp)
+        if melhor is None or (d_ini + d_fim) < melhor[0]:
+            melhor = (d_ini + d_fim, coords_comp, d_ini, d_fim)
+
+    _, coords, d_ini, d_fim = melhor
+    if d_ini > _COSTURA_DIST_MAX_M or d_fim > _COSTURA_DIST_MAX_M:
+        if verbose:
+            print(f"  ⚠  Nenhum trecho de '{ref_ou_nome}' passa perto de "
+                  f"início/fim (mais próximo: início {d_ini:.0f} m, fim {d_fim:.0f} m).")
+        return None
 
     d_primeiro = _haversine_m(ponto_inicio, coords[0])
     d_ultimo   = _haversine_m(ponto_inicio, coords[-1])
