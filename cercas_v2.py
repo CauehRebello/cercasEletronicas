@@ -128,6 +128,16 @@ def ler_lote(caminho: str) -> List[Dict[str, str]]:
                 raise ValueError(
                     f"Lote, linha {num_linha}: informe 'via' ou 'polilinha'."
                 )
+            # Sanidade: 'inicio'/'fim' devem ser um único campo "lat,lon" entre
+            # aspas duplas; vírgula sem aspas quebra o CSV em campos extras e
+            # csv.DictReader nunca vê essa vírgula aqui.  [FAT-67, DEC-5]
+            for campo in ("inicio", "fim"):
+                valor = row.get(campo)
+                if valor and valor.strip().count(",") != 1:
+                    raise ValueError(
+                        f"Lote, linha {num_linha}: campo '{campo}' inválido ('{valor}'). "
+                        f"Envolva as coordenadas em aspas duplas, ex.: \"-9.25049,-35.76806\"."
+                    )
             row["_num_linha"] = str(num_linha)
             linhas.append(row)
 
@@ -454,8 +464,15 @@ def _linha_sascar(tipo_pol: str, codigo: str, extensao_m: int,
     criacao   = datetime.now().strftime("%Y%m%d_%H:%M")
     descricao = f"Extensao: {extensao_m}m - Criacao {criacao}"
     campos    = [f'"{tipo_pol}"', f'"{codigo}"', f'"{descricao}"']
+    # Dedup de vértices consecutivos idênticos após arredondar p/ 6 casas
+    # (buffer cap_style=2 pode gerar repetição no arredondamento).  [FAT-66, DEC-4]
+    ultimo = None
     for lat, lon in vertices:
-        campos.append(f"{lat:.6f},{lon:.6f}")
+        par = (round(lat, 6), round(lon, 6))
+        if par == ultimo:
+            continue
+        ultimo = par
+        campos.append(f"{par[0]:.6f},{par[1]:.6f}")
     return ";".join(campos)
 
 
