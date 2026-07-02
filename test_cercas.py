@@ -203,6 +203,19 @@ def test_gerar_cercas_modo_b_comprimento_maior_que_via():
         gerar_cercas(_POLY, "B", _INICIO, None, 50_000.0, 0.0, 0.0, verbose=False)
 
 
+# ── Módulo 1B: ler_lote — validação de 'uf' [FAT-82] ─────────────────────────
+
+def test_ler_lote_uf_invalida():
+    caminho = _escrever_lote(
+        'BR-116,,A,"-25.38,-49.19","-25.39,-49.19",,0,0,50,BR-116,LUZ,MGX,60,1\n'
+    )
+    try:
+        with pytest.raises(ValueError, match="FAT-82"):
+            ler_lote(caminho)
+    finally:
+        os.unlink(caminho)
+
+
 # ── Módulo 1B: ler_lote — validação de 'modo' [FAT-85] ───────────────────────
 
 _CABECALHO_LOTE = (
