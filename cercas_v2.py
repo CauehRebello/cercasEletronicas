@@ -108,7 +108,8 @@ def ler_lote(caminho: str) -> List[Dict[str, str]]:
       - 'modo' = A exige 'fim'; 'modo' = B exige 'comprimento'. [FAT-48]
       - Colunas ausentes usam os mesmos padrões do modo single-cerca:
         pre=0, pos=0, buffer=50.0. [FAT-43, FAT-44]
-      - 'seq' deve ser único por linha do lote (1–999). [FAT-45]
+      - 'seq' deve ser um inteiro entre 1 e 999 (unicidade não verificada). [FAT-45, FAT-86]
+      - 'velocidade' deve ser um inteiro maior que zero. [FAT-86]
     """
     linhas: List[Dict[str, str]] = []
     with open(caminho, "r", encoding="utf-8", newline="") as f:
@@ -159,6 +160,38 @@ def ler_lote(caminho: str) -> List[Dict[str, str]]:
                 raise ValueError(
                     f"Lote, linha {num_linha}: campo 'modo' deve ser 'A' ou 'B'. "
                     f"Valor encontrado: '{modo_valor or '(vazio)'}'. [FAT-85]"
+                )
+            # 'velocidade' e 'seq' devem ser inteiros válidos (seq 1–999,
+            # mesma faixa do fluxo single-cerca). Validado aqui para citar o
+            # número da linha — sem isso, um valor não numérico só falhava
+            # mais tarde em processar_linha_lote com erro genérico do Python
+            # (ex.: "invalid literal for int()"), sem indicar a linha. [FAT-86]
+            velocidade_valor = (row.get("velocidade") or "").strip()
+            try:
+                velocidade_int = int(velocidade_valor)
+            except ValueError:
+                raise ValueError(
+                    f"Lote, linha {num_linha}: campo 'velocidade' deve ser um número "
+                    f"inteiro (KmH). Valor encontrado: '{velocidade_valor}'. [FAT-86]"
+                )
+            if velocidade_int <= 0:
+                raise ValueError(
+                    f"Lote, linha {num_linha}: campo 'velocidade' deve ser maior que "
+                    f"zero. Valor encontrado: '{velocidade_valor}'. [FAT-86]"
+                )
+
+            seq_valor = (row.get("seq") or "").strip()
+            try:
+                seq_int = int(seq_valor)
+            except ValueError:
+                raise ValueError(
+                    f"Lote, linha {num_linha}: campo 'seq' deve ser um número inteiro "
+                    f"entre 1 e 999. Valor encontrado: '{seq_valor}'. [FAT-86]"
+                )
+            if not 1 <= seq_int <= 999:
+                raise ValueError(
+                    f"Lote, linha {num_linha}: campo 'seq' deve estar entre 1 e 999. "
+                    f"Valor encontrado: '{seq_valor}'. [FAT-86]"
                 )
             row["_num_linha"] = str(num_linha)
             linhas.append(row)

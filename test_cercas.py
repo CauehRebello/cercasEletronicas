@@ -250,6 +250,49 @@ def test_ler_lote_modo_vazio():
         os.unlink(caminho)
 
 
+# ── Módulo 1B: ler_lote — validação de 'velocidade'/'seq' [FAT-86] ──────────
+
+def test_ler_lote_velocidade_nao_numerica():
+    caminho = _escrever_lote(
+        'BR-116,,A,"-25.38,-49.19","-25.39,-49.19",,0,0,50,BR-116,LUZ,MG,rapido,1\n'
+    )
+    try:
+        with pytest.raises(ValueError, match="FAT-86"):
+            ler_lote(caminho)
+    finally:
+        os.unlink(caminho)
+
+def test_ler_lote_velocidade_zero():
+    caminho = _escrever_lote(
+        'BR-116,,A,"-25.38,-49.19","-25.39,-49.19",,0,0,50,BR-116,LUZ,MG,0,1\n'
+    )
+    try:
+        with pytest.raises(ValueError, match="FAT-86"):
+            ler_lote(caminho)
+    finally:
+        os.unlink(caminho)
+
+def test_ler_lote_seq_nao_numerico():
+    caminho = _escrever_lote(
+        'BR-116,,A,"-25.38,-49.19","-25.39,-49.19",,0,0,50,BR-116,LUZ,MG,60,abc\n'
+    )
+    try:
+        with pytest.raises(ValueError, match="FAT-86"):
+            ler_lote(caminho)
+    finally:
+        os.unlink(caminho)
+
+def test_ler_lote_seq_fora_da_faixa():
+    caminho = _escrever_lote(
+        'BR-116,,A,"-25.38,-49.19","-25.39,-49.19",,0,0,50,BR-116,LUZ,MG,60,1000\n'
+    )
+    try:
+        with pytest.raises(ValueError, match="FAT-86"):
+            ler_lote(caminho)
+    finally:
+        os.unlink(caminho)
+
+
 # ── Módulo 2: retry de erro de rede no Overpass [FAT-84] ─────────────────────
 
 class _RespostaFalsa:
