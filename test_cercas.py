@@ -2,6 +2,8 @@
 Testes — cercas_v2.py
 Cobre parsing, geometria (sem OSM), formatação SASCAR e validação.
 """
+import json
+import sqlite3
 import tempfile
 import os
 import pytest
@@ -10,12 +12,17 @@ import requests
 import cercas_v2
 from cercas_v2 import (
     _COSTURA_DIST_MAX_M,
+    _cache_get,
+    _cache_key,
+    _cache_set,
     _costura_ways,
     _haversine_m,
     _montar_codigo,
     _overpass_query,
     _utm_epsg,
     _validar_rodovia,
+    buscar_geometria_osm,
+    consultar_historico,
     detectar_sobreposicao,
     exportar_csv,
     gerar_cercas,
@@ -23,6 +30,7 @@ from cercas_v2 import (
     ler_lote,
     parse_coord,
     parse_polilinha_manual,
+    salvar_no_historico,
     validar_csv,
 )
 
@@ -341,6 +349,121 @@ def test_overpass_query_falha_persistente_de_rede(monkeypatch):
     with pytest.raises(Exception, match="FAT-84"):
         _overpass_query("query fake")
 
+def test_overpass_query_respeita_max_tentativas_customizado(monkeypatch):
+    chamadas = {"n": 0}
+
+    def post_falso(*args, **kwargs):
+        chamadas["n"] += 1
+        raise requests.exceptions.ConnectionError("falha simulada")
+
+    monkeypatch.setattr(cercas_v2.requests, "post", post_falso)
+    monkeypatch.setattr(cercas_v2.time, "sleep", lambda s: None)
+
+    with pytest.raises(Exception, match="FAT-84"):
+        _overpass_query("query fake", max_tentativas=5)
+    assert chamadas["n"] == 5
+
+def test_overpass_query_respeita_espera_customizada(monkeypatch):
+    esperas = []
+
+    def post_falso(*args, **kwargs):
+        raise requests.exceptions.ConnectionError("falha simulada")
+
+    monkeypatch.setattr(cercas_v2.requests, "post", post_falso)
+    monkeypatch.setattr(cercas_v2.time, "sleep", lambda s: esperas.append(s))
+
+    with pytest.raises(Exception, match="FAT-84"):
+        _overpass_query("query fake", max_tentativas=3, espera_base_s=7.5)
+    assert esperas == [7.5, 7.5]
+
+def test_overpass_query_default_reproduz_comportamento_atual(monkeypatch):
+    chamadas = {"n": 0}
+
+    def post_falso(*args, **kwargs):
+        chamadas["n"] += 1
+        raise requests.exceptions.ConnectionError("falha simulada")
+
+    monkeypatch.setattr(cercas_v2.requests, "post", post_falso)
+    monkeypatch.setattr(cercas_v2.time, "sleep", lambda s: None)
+
+    with pytest.raises(Exception, match="FAT-84"):
+        _overpass_query("query fake")
+    assert chamadas["n"] == 3
+
+
+# ── Módulo 2: cache local de geometrias OSM [FAT-154, S4] ────────────────────
+
+class _RespostaFalsaGeometria:
+    status_code = 200
+    def raise_for_status(self):
+        pass
+    def json(self):
+        return {
+            "elements": [
+                {"type": "node", "id": 1, "lat": 0.0, "lon": 0.0},
+                {"type": "node", "id": 2, "lat": 0.0, "lon": 1.0},
+                {"type": "way", "id": 100, "nodes": [1, 2]},
+            ]
+        }
+
+def test_cache_desabilitado_sempre_busca_rede(monkeypatch, tmp_path):
+    monkeypatch.setattr(cercas_v2, "_CACHE_PATH", str(tmp_path / "cache.json"))
+    chamadas = {"n": 0}
+
+    def post_falso(*args, **kwargs):
+        chamadas["n"] += 1
+        return _RespostaFalsaGeometria()
+
+    monkeypatch.setattr(cercas_v2.requests, "post", post_falso)
+
+    buscar_geometria_osm("BR-116", (0.0, 0.0), (0.0, 1.0), verbose=False)
+    buscar_geometria_osm("BR-116", (0.0, 0.0), (0.0, 1.0), verbose=False)
+    assert chamadas["n"] == 2
+
+def test_cache_hit_evita_segunda_chamada_de_rede(monkeypatch, tmp_path):
+    monkeypatch.setattr(cercas_v2, "_CACHE_PATH", str(tmp_path / "cache.json"))
+    chamadas = {"n": 0}
+
+    def post_falso(*args, **kwargs):
+        chamadas["n"] += 1
+        return _RespostaFalsaGeometria()
+
+    monkeypatch.setattr(cercas_v2.requests, "post", post_falso)
+
+    r1 = buscar_geometria_osm("BR-116", (0.0, 0.0), (0.0, 1.0), verbose=False, usar_cache=True)
+    r2 = buscar_geometria_osm("BR-116", (0.0, 0.0), (0.0, 1.0), verbose=False, usar_cache=True)
+    assert chamadas["n"] == 1
+    assert r1 == r2
+
+def test_cache_expirado_busca_de_novo(monkeypatch, tmp_path):
+    caminho = str(tmp_path / "cache.json")
+    monkeypatch.setattr(cercas_v2, "_CACHE_PATH", caminho)
+    chamadas = {"n": 0}
+
+    def post_falso(*args, **kwargs):
+        chamadas["n"] += 1
+        return _RespostaFalsaGeometria()
+
+    monkeypatch.setattr(cercas_v2.requests, "post", post_falso)
+
+    chave = _cache_key("BR-116", (0.0, 0.0), (0.0, 1.0))
+    _cache_set(chave, [[0.0, 0.0], [0.0, 1.0]], ttl_s=1, caminho=caminho)
+    entrada = _cache_get(chave, caminho=caminho)
+    assert entrada is not None  # sanity: gravou corretamente antes de expirar
+
+    # Força expiração: recua o timestamp gravado para além do ttl.
+    with open(caminho, "r", encoding="utf-8") as f:
+        dados = json.load(f)
+    dados[chave]["timestamp"] -= 1000
+    with open(caminho, "w", encoding="utf-8") as f:
+        json.dump(dados, f)
+
+    buscar_geometria_osm(
+        "BR-116", (0.0, 0.0), (0.0, 1.0), verbose=False,
+        usar_cache=True, cache_ttl_s=1,
+    )
+    assert chamadas["n"] == 1
+
 
 # ── Módulo 7: detecção de sobreposição [FAT-78] ──────────────────────────────
 
@@ -400,3 +523,64 @@ def test_gerar_relatorio_com_sobreposicoes():
         assert "A1" in conteudo and "A2" in conteudo
     finally:
         os.unlink(caminho)
+
+
+# ── Módulo 9: histórico persistente (SQLite) [FAT-155, S5] ───────────────────
+
+def _registro_historico(codigo="PRI - BR-116 - LUZ_MG - 60 KmH - 001"):
+    return {
+        "codigo": codigo, "tipo": "PRI", "seq": 1,
+        "vertices": [(-25.0, -49.0), (-25.1, -49.1)], "extensao_m": 1000,
+        "rodovia": "BR-116", "cidade": "LUZ", "uf": "MG", "velocidade": 60,
+    }
+
+def test_salvar_no_historico_cria_tabela_e_grava(tmp_path):
+    caminho_db = str(tmp_path / "historico.db")
+    n = salvar_no_historico([_registro_historico()], caminho_db, verbose=False)
+    assert n == 1
+
+    conn = sqlite3.connect(caminho_db)
+    try:
+        row = conn.execute(
+            "SELECT codigo, tipo, rodovia, cidade, uf, velocidade, seq, extensao_m, "
+            "num_vertices FROM cercas"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row == ("PRI - BR-116 - LUZ_MG - 60 KmH - 001", "PRI", "BR-116", "LUZ", "MG", 60, 1, 1000, 2)
+
+def test_salvar_no_historico_codigo_duplicado_gera_alerta_nao_bloqueante(tmp_path, capsys):
+    caminho_db = str(tmp_path / "historico.db")
+    salvar_no_historico([_registro_historico()], caminho_db, verbose=True)
+    capsys.readouterr()
+
+    n = salvar_no_historico([_registro_historico()], caminho_db, verbose=True)
+    saida = capsys.readouterr().out
+
+    assert n == 1  # grava mesmo assim — não bloqueia
+    assert "ALERTA" in saida
+    assert "já existe no histórico" in saida
+
+def test_consultar_historico_filtra_por_rodovia_uf_codigo(tmp_path):
+    caminho_db = str(tmp_path / "historico.db")
+    registros = [
+        {**_registro_historico("PRI - BR-116 - LUZ_MG - 60 KmH - 001"),
+         "rodovia": "BR-116", "uf": "MG"},
+        {**_registro_historico("PRI - BR-470 - BLUMENAU_SC - 80 KmH - 002"),
+         "rodovia": "BR-470", "uf": "SC"},
+        {**_registro_historico("PRI - BR-470 - BLUMENAU_SC - 80 KmH - 003"),
+         "rodovia": "BR-470", "uf": "SC"},
+    ]
+    salvar_no_historico(registros, caminho_db, verbose=False)
+
+    por_rodovia = consultar_historico(caminho_db, {"rodovia": "BR-470"})
+    assert len(por_rodovia) == 2
+
+    por_uf = consultar_historico(caminho_db, {"uf": "MG"})
+    assert len(por_uf) == 1
+
+    por_codigo = consultar_historico(caminho_db, {"codigo": "PRI - BR-470 - BLUMENAU_SC - 80 KmH - 003"})
+    assert len(por_codigo) == 1
+
+def test_consultar_historico_sem_arquivo_retorna_lista_vazia(tmp_path):
+    assert consultar_historico(str(tmp_path / "nao_existe.db")) == []
