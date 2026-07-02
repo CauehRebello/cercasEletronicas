@@ -5,16 +5,22 @@ Cobre parsing, geometria (sem OSM), formatação SASCAR e validação.
 import tempfile
 import os
 import pytest
+import requests
 
+import cercas_v2
 from cercas_v2 import (
     _COSTURA_DIST_MAX_M,
     _costura_ways,
     _haversine_m,
     _montar_codigo,
+    _overpass_query,
     _utm_epsg,
     _validar_rodovia,
+    detectar_sobreposicao,
     exportar_csv,
     gerar_cercas,
+    gerar_relatorio,
+    ler_lote,
     parse_coord,
     parse_polilinha_manual,
     validar_csv,
@@ -184,5 +190,157 @@ def test_validar_linha_invalida():
     try:
         erros = validar_csv(caminho, verbose=False)
         assert any("CÓDIGO" in e for e in erros)
+    finally:
+        os.unlink(caminho)
+
+
+# ── Módulo 4: guarda de comprimento no Modo B [FAT-81] ───────────────────────
+
+def test_gerar_cercas_modo_b_comprimento_maior_que_via():
+    # _POLY tem ~7,8 km; pedir 50 km a partir de _INICIO deve falhar,
+    # em vez de truncar silenciosamente. [FAT-81]
+    with pytest.raises(ValueError, match="FAT-81"):
+        gerar_cercas(_POLY, "B", _INICIO, None, 50_000.0, 0.0, 0.0, verbose=False)
+
+
+# ── Módulo 1B: ler_lote — validação de 'modo' [FAT-85] ───────────────────────
+
+_CABECALHO_LOTE = (
+    "via,polilinha,modo,inicio,fim,comprimento,pre,pos,buffer,"
+    "rodovia,cidade,uf,velocidade,seq\n"
+)
+
+def _escrever_lote(linhas: str) -> str:
+    with tempfile.NamedTemporaryFile(
+        suffix=".csv", delete=False, mode="w", encoding="utf-8", newline=""
+    ) as f:
+        f.write(_CABECALHO_LOTE)
+        f.write(linhas)
+        caminho = f.name
+    return caminho
+
+def test_ler_lote_modo_valido():
+    caminho = _escrever_lote(
+        'BR-116,,A,"-25.38,-49.19","-25.39,-49.19",,0,0,50,BR-116,LUZ,MG,60,1\n'
+    )
+    try:
+        linhas = ler_lote(caminho)
+        assert linhas[0]["modo"] == "A"
+    finally:
+        os.unlink(caminho)
+
+def test_ler_lote_modo_invalido():
+    caminho = _escrever_lote(
+        'BR-116,,C,"-25.38,-49.19",,,0,0,50,BR-116,LUZ,MG,60,1\n'
+    )
+    try:
+        with pytest.raises(ValueError, match="FAT-85"):
+            ler_lote(caminho)
+    finally:
+        os.unlink(caminho)
+
+def test_ler_lote_modo_vazio():
+    caminho = _escrever_lote(
+        'BR-116,,,"-25.38,-49.19",,,0,0,50,BR-116,LUZ,MG,60,1\n'
+    )
+    try:
+        with pytest.raises(ValueError, match="modo"):
+            ler_lote(caminho)
+    finally:
+        os.unlink(caminho)
+
+
+# ── Módulo 2: retry de erro de rede no Overpass [FAT-84] ─────────────────────
+
+class _RespostaFalsa:
+    status_code = 200
+    def raise_for_status(self):
+        pass
+    def json(self):
+        return {"elements": []}
+
+def test_overpass_query_recupera_de_erro_de_rede_transitorio(monkeypatch):
+    chamadas = {"n": 0}
+
+    def post_falso(*args, **kwargs):
+        chamadas["n"] += 1
+        if chamadas["n"] == 1:
+            raise requests.exceptions.ConnectionError("falha simulada")
+        return _RespostaFalsa()
+
+    monkeypatch.setattr(cercas_v2.requests, "post", post_falso)
+    monkeypatch.setattr(cercas_v2.time, "sleep", lambda s: None)
+
+    resultado = _overpass_query("query fake")
+    assert resultado == {"elements": []}
+    assert chamadas["n"] == 2
+
+def test_overpass_query_falha_persistente_de_rede(monkeypatch):
+    def post_falso(*args, **kwargs):
+        raise requests.exceptions.ConnectionError("falha simulada")
+
+    monkeypatch.setattr(cercas_v2.requests, "post", post_falso)
+    monkeypatch.setattr(cercas_v2.time, "sleep", lambda s: None)
+
+    with pytest.raises(Exception, match="FAT-84"):
+        _overpass_query("query fake")
+
+
+# ── Módulo 7: detecção de sobreposição [FAT-78] ──────────────────────────────
+
+def test_detectar_sobreposicao_encontra_par_sobreposto():
+    registros = [
+        {"codigo": "A1", "seq": 1, "vertices": [(0, 0), (0, 1), (1, 1), (1, 0)]},
+        {"codigo": "A2", "seq": 2, "vertices": [(0.5, 0.5), (0.5, 1.5), (1.5, 1.5), (1.5, 0.5)]},
+    ]
+    pares = detectar_sobreposicao(registros)
+    assert pares == [("A1", "A2")]
+
+def test_detectar_sobreposicao_ignora_mesmo_seq():
+    # PRI e PRE do mesmo conjunto (mesmo seq) sempre se sobrepõem — não é anomalia. [FAT-39]
+    registros = [
+        {"codigo": "PRI-1", "seq": 1, "vertices": [(0, 0), (0, 1), (1, 1), (1, 0)]},
+        {"codigo": "PRE-1", "seq": 1, "vertices": [(0, 0), (0, 1), (1, 1), (1, 0)]},
+    ]
+    assert detectar_sobreposicao(registros) == []
+
+def test_detectar_sobreposicao_sem_intersecao():
+    registros = [
+        {"codigo": "A1", "seq": 1, "vertices": [(0, 0), (0, 1), (1, 1), (1, 0)]},
+        {"codigo": "A2", "seq": 2, "vertices": [(10, 10), (10, 11), (11, 11), (11, 10)]},
+    ]
+    assert detectar_sobreposicao(registros) == []
+
+
+# ── Módulo 8: relatório de cercas geradas [FAT-78] ───────────────────────────
+
+def test_gerar_relatorio_conteudo_basico():
+    registros = [
+        {"codigo": "PRI-1", "tipo": "PRI", "vertices": [(-25.0, -49.0), (-25.1, -49.1)], "extensao_m": 1000},
+    ]
+    with tempfile.NamedTemporaryFile(suffix=".csv", delete=False, mode="w") as f:
+        caminho = f.name
+    try:
+        n = gerar_relatorio(registros, caminho, verbose=False)
+        assert n == 1
+        with open(caminho, encoding="utf-8") as f:
+            conteudo = f.read()
+        assert "PRI-1" in conteudo
+        assert "ALERTA" not in conteudo
+    finally:
+        os.unlink(caminho)
+
+def test_gerar_relatorio_com_sobreposicoes():
+    registros = [
+        {"codigo": "A1", "tipo": "PRI", "vertices": [(-25.0, -49.0), (-25.1, -49.1)], "extensao_m": 500},
+    ]
+    with tempfile.NamedTemporaryFile(suffix=".csv", delete=False, mode="w") as f:
+        caminho = f.name
+    try:
+        gerar_relatorio(registros, caminho, sobreposicoes=[("A1", "A2")], verbose=False)
+        with open(caminho, encoding="utf-8") as f:
+            conteudo = f.read()
+        assert "ALERTA DE SOBREPOSICAO" in conteudo
+        assert "A1" in conteudo and "A2" in conteudo
     finally:
         os.unlink(caminho)

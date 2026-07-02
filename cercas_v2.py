@@ -54,7 +54,7 @@ from typing import Dict, List, Optional, Tuple
 
 import requests
 from pyproj import Transformer
-from shapely.geometry import LineString, Point
+from shapely.geometry import LineString, Point, Polygon
 from shapely.ops import substring as line_substring
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -104,6 +104,7 @@ def ler_lote(caminho: str) -> List[Dict[str, str]]:
 
     Regras:
       - Cada linha deve informar 'via' OU 'polilinha' (nunca ambos vazios). [FAT-24]
+      - 'modo' deve ser 'A' ou 'B'. [FAT-85]
       - 'modo' = A exige 'fim'; 'modo' = B exige 'comprimento'. [FAT-48]
       - Colunas ausentes usam os mesmos padrões do modo single-cerca:
         pre=0, pos=0, buffer=50.0. [FAT-43, FAT-44]
@@ -138,6 +139,27 @@ def ler_lote(caminho: str) -> List[Dict[str, str]]:
                         f"Lote, linha {num_linha}: campo '{campo}' inválido ('{valor}'). "
                         f"Envolva as coordenadas em aspas duplas, ex.: \"-9.25049,-35.76806\"."
                     )
+            # UF deve ter exatamente 2 letras — mesma regra do fluxo
+            # single-cerca (CLI). Validado aqui, na leitura, em vez de só
+            # no final via validar_csv (que só falharia depois de
+            # processar o lote inteiro).  [FAT-82]
+            uf_valor = (row.get("uf") or "").strip()
+            if len(uf_valor) != 2:
+                raise ValueError(
+                    f"Lote, linha {num_linha}: campo 'uf' deve ter exatamente 2 letras "
+                    f"(ex.: MG, SC). Valor encontrado: '{uf_valor}'. [FAT-82]"
+                )
+            # 'modo' deve ser 'A' ou 'B' — mesma regra do fluxo single-cerca
+            # (CLI usa argparse choices=["A","B"]). Sem esta checagem, um
+            # valor inválido (vazio, typo) só falhava mais tarde dentro de
+            # gerar_cercas, tratado silenciosamente como Modo B e quebrando
+            # com TypeError se 'comprimento' também estivesse vazio.  [FAT-85]
+            modo_valor = (row.get("modo") or "").strip().upper()
+            if modo_valor not in ("A", "B"):
+                raise ValueError(
+                    f"Lote, linha {num_linha}: campo 'modo' deve ser 'A' ou 'B'. "
+                    f"Valor encontrado: '{modo_valor or '(vazio)'}'. [FAT-85]"
+                )
             row["_num_linha"] = str(num_linha)
             linhas.append(row)
 
@@ -195,6 +217,22 @@ def _overpass_query(q: str) -> dict:
                 time.sleep(3)
                 continue
             raise e
+
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            # Erros de rede transitórios (conexão caiu, DNS falhou, timeout de
+            # resposta) não chegam a gerar um HTTPError — ocorrem antes de haver
+            # resposta HTTP. Sem este bloco, escapavam do loop de tentativas e
+            # abortavam na primeira falha, ao contrário do que a docstring da
+            # função promete ("tentativas automáticas").  [FAT-84]
+            if tentativa < tentativas - 1:
+                print(f"  ⚠  Falha de rede ({type(e).__name__}). Tentando novamente em 3 segundos... "
+                      f"(Tentativa {tentativa + 1}/{tentativas})")
+                time.sleep(3)
+                continue
+            raise Exception(
+                f"Falha de rede persistente ao acessar o Overpass API após "
+                f"{tentativas} tentativas: {e}  [FAT-84]"
+            )
 
         except ValueError as e:
             if tentativa < tentativas - 1:
@@ -408,6 +446,18 @@ def gerar_cercas(
             inicio_m, fim_m = fim_m, inicio_m
     else:   # Modo B [FAT-28]
         fim_m = min(L, inicio_m + comprimento_m)
+        # Cobertura: a via encontrada precisa ter comprimento_m metros a
+        # partir do início; se for mais curta, o corte por min(L, ...) acima
+        # seria silencioso. Falha explícita em vez de cerca truncada sem
+        # aviso.  [FAT-81]
+        faltante_m = comprimento_m - (fim_m - inicio_m)
+        if faltante_m > 1.0:  # tolerância de 1 m para erro de projeção/arredondamento
+            raise ValueError(
+                f"Modo B: a via encontrada tem apenas {L - inicio_m:.1f} m a partir "
+                f"do início, mas foram pedidos {comprimento_m:.1f} m de cerca "
+                f"(faltam {faltante_m:.1f} m). Cerca NÃO gerada — verifique a via "
+                f"ou reduza --comprimento. [FAT-81]"
+            )
 
     comprimento_cerca = fim_m - inicio_m
     if verbose:
@@ -646,12 +696,17 @@ def validar_csv(caminho: str, verbose: bool = True) -> List[str]:
 # ORQUESTRAÇÃO DO LOTE (BATCH)  [FAT-63, DEC-3]
 # ─────────────────────────────────────────────────────────────────────────────
 
-def processar_linha_lote(row: Dict[str, str], verbose: bool = True) -> List[str]:
+def processar_linha_lote(row: Dict[str, str], verbose: bool = True) -> Tuple[List[str], List[Dict]]:
     """
     Processa UMA linha do arquivo de lote: geometria → buffer/recorte →
     montagem das linhas SASCAR (sem escrever em disco).
     Reusa exatamente os módulos 2, 3 e 4 originais — nenhum invariante
-    alterado. Retorna as linhas SASCAR (PRI [+ PRE]) desta cerca.
+    alterado. Retorna (linhas_sascar, registros_estruturados):
+      - linhas_sascar: linhas SASCAR (PRI [+ PRE]) desta cerca — comportamento
+        idêntico ao original.
+      - registros_estruturados: mesma informação em forma de dict (codigo,
+        tipo, seq, vertices, extensao_m), usada pelos Módulos 7/8
+        (sobreposição/relatório, FAT-78) sem duplicar cálculo de geometria.
     """
     num_linha = row.get("_num_linha", "?")
 
@@ -691,30 +746,189 @@ def processar_linha_lote(row: Dict[str, str], verbose: bool = True) -> List[str]
         buffer_m=buffer_m, verbose=verbose,
     )
 
-    return _montar_linhas_cerca(
+    seq = int(row["seq"])
+    linhas_sascar = _montar_linhas_cerca(
         cercas=cercas,
         rodovia=row["rodovia"], cidade=row["cidade"], uf=row["uf"],
-        velocidade=int(row["velocidade"]), seq=int(row["seq"]),
+        velocidade=int(row["velocidade"]), seq=seq,
     )
 
+    registros_estruturados: List[Dict] = []
+    for chave in ("PRI", "PRE"):
+        dados = cercas.get(chave, {})
+        vertices = dados.get("vertices", [])
+        if not vertices:
+            continue
+        codigo = _montar_codigo(chave, row["rodovia"], row["cidade"], row["uf"], int(row["velocidade"]), seq)
+        registros_estruturados.append({
+            "codigo": codigo, "tipo": chave, "seq": seq,
+            "vertices": vertices, "extensao_m": dados.get("extensao_m", 0),
+        })
 
-def processar_lote(caminho_entrada: str, caminho_saida: str, verbose: bool = True) -> int:
+    return linhas_sascar, registros_estruturados
+
+
+def processar_lote(
+    caminho_entrada: str,
+    caminho_saida: str,
+    verbose: bool = True,
+    caminho_relatorio: Optional[str] = None,
+) -> Tuple[int, List[Dict], List[Tuple[str, str]]]:
     """
     Lê o arquivo de lote, gera todas as cercas e exporta UM único arquivo
     consolidado.  [FAT-63, DEC-3]
-    Retorna o total de registros gravados. Propaga o erro da primeira
-    linha inválida (sem gravar arquivo parcial) — R6/R2: falha explícita,
-    nunca resultado parcial silencioso.
+    Retorna (total_gravado, registros_estruturados, sobreposicoes):
+      - total_gravado: número de registros SASCAR gravados (comportamento
+        original, inalterado).
+      - registros_estruturados: dados de cada cerca (codigo/tipo/seq/
+        vertices/extensao_m), usados pelos Módulos 7/8 (FAT-78).
+      - sobreposicoes: pares de código com sobreposição detectada (Módulo 7,
+        S3) — lista vazia se `caminho_relatorio` não for informado ou se
+        nenhuma sobreposição for encontrada. Não bloqueante (Opção A).
+    Propaga o erro da primeira linha inválida (sem gravar arquivo parcial) —
+    R6/R2: falha explícita, nunca resultado parcial silencioso.
     """
     linhas_lote = ler_lote(caminho_entrada)
     if verbose:
         print(f"  ✓ {len(linhas_lote)} cerca(s) no arquivo de lote '{caminho_entrada}'.")
 
     todas_linhas: List[str] = []
+    todos_registros: List[Dict] = []
     for row in linhas_lote:
-        todas_linhas.extend(processar_linha_lote(row, verbose=verbose))
+        linhas_sascar, registros = processar_linha_lote(row, verbose=verbose)
+        todas_linhas.extend(linhas_sascar)
+        todos_registros.extend(registros)
 
-    return exportar_lote(todas_linhas, caminho_saida, verbose=verbose)
+    total = exportar_lote(todas_linhas, caminho_saida, verbose=verbose)
+
+    sobreposicoes: List[Tuple[str, str]] = []
+    if caminho_relatorio:
+        if verbose:
+            print(f"\n[MÓDULO 7] Verificando sobreposição entre polígonos...  [FAT-78, S3]")
+        sobreposicoes = detectar_sobreposicao(todos_registros)
+        if verbose:
+            print(f"\n[MÓDULO 8] Gerando relatório '{caminho_relatorio}'...  [FAT-78, S5]")
+        gerar_relatorio(todos_registros, caminho_relatorio, sobreposicoes, verbose=verbose)
+
+    return total, todos_registros, sobreposicoes
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MÓDULO 7 — DETECÇÃO DE SOBREPOSIÇÃO ENTRE POLÍGONOS  [FAT-78, S3]
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Endereça a Premissa P7 (buffer PRE pode sobrepor polígonos de vias
+# paralelas). Ação em caso de sobreposição = Opção A: apenas alerta,
+# sem bloqueio e sem pausa interativa (compatível com --batch).
+# Não altera geometria, buffer, recorte nem exportação — apenas analisa
+# a saída já calculada pelos módulos 3/4. [Decisão registrada na SES-15]
+
+def _construir_poligono(vertices: List[Tuple[float, float]]) -> Optional[Polygon]:
+    """Constrói um Polygon Shapely (lon, lat) a partir dos vértices (lat, lon)
+    de uma cerca já gerada. Usado apenas para análise de sobreposição —
+    não participa do cálculo de buffer/recorte."""
+    if len(vertices) < 3:
+        return None
+    try:
+        return Polygon([(lon, lat) for lat, lon in vertices])
+    except Exception:
+        return None
+
+
+def detectar_sobreposicao(registros: List[Dict]) -> List[Tuple[str, str]]:
+    """
+    Compara os polígonos de cercas DIFERENTES (SEQ diferente) e retorna os
+    pares de CÓDIGO que se sobrepõem.  [FAT-78, S3]
+
+    PRI e PRE do MESMO conjunto (mesmo SEQ) sempre se sobrepõem no segmento
+    central por definição de arquitetura (FAT-39) — isso não é uma anomalia
+    e é excluído da checagem.
+
+    `registros`: lista de dicts com pelo menos 'codigo', 'seq', 'vertices'.
+    Não bloqueia nem interrompe a execução — apenas retorna os pares
+    encontrados para o chamador decidir o que fazer (alerta/relatório).
+    """
+    pares_sobrepostos: List[Tuple[str, str]] = []
+    candidatos = [
+        (r, _construir_poligono(r.get("vertices", [])))
+        for r in registros if r.get("vertices")
+    ]
+
+    for i in range(len(candidatos)):
+        r1, p1 = candidatos[i]
+        if p1 is None:
+            continue
+        for j in range(i + 1, len(candidatos)):
+            r2, p2 = candidatos[j]
+            if p2 is None:
+                continue
+            if r1.get("seq") == r2.get("seq"):
+                continue  # PRI/PRE do mesmo conjunto — sobreposição esperada [FAT-39]
+            try:
+                if p1.intersects(p2):
+                    pares_sobrepostos.append((r1["codigo"], r2["codigo"]))
+            except Exception:
+                continue
+
+    return pares_sobrepostos
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MÓDULO 8 — RELATÓRIO DE CERCAS GERADAS  [FAT-78, S5]
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Relatório tabular (CSV) resumindo as cercas geradas em uma execução
+# (single-cerca ou lote). Consome apenas dados já produzidos pelos módulos
+# 3/4/5 — não recalcula geometria nem altera o arquivo de exportação SASCAR.
+
+def gerar_relatorio(
+    registros: List[Dict],
+    caminho: str,
+    sobreposicoes: Optional[List[Tuple[str, str]]] = None,
+    verbose: bool = True,
+) -> int:
+    """
+    Grava um relatório CSV com o resumo das cercas geradas nesta execução.
+    [FAT-78, S5]
+
+    Colunas: codigo, tipo, extensao_m, vertice_inicial, vertice_final,
+    num_vertices. Se houver sobreposições (Módulo 7), acrescenta uma seção
+    de alertas ao final — apenas informativa, não bloqueante (Opção A).
+
+    Retorna o número de cercas (linhas) registradas no relatório.
+    """
+    with open(caminho, "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f, delimiter=";")
+        writer.writerow(
+            ["codigo", "tipo", "extensao_m", "vertice_inicial", "vertice_final", "num_vertices"]
+        )
+        n = 0
+        for r in registros:
+            vertices = r.get("vertices", [])
+            if not vertices:
+                continue
+            v_ini = f"{vertices[0][0]:.6f},{vertices[0][1]:.6f}"
+            v_fim = f"{vertices[-1][0]:.6f},{vertices[-1][1]:.6f}"
+            writer.writerow([
+                r.get("codigo", ""), r.get("tipo", ""), r.get("extensao_m", 0),
+                v_ini, v_fim, len(vertices),
+            ])
+            n += 1
+
+        if sobreposicoes:
+            writer.writerow([])
+            writer.writerow(["ALERTA DE SOBREPOSICAO (S3) - nao bloqueante"])
+            writer.writerow(["codigo_a", "relacao", "codigo_b"])
+            for a, b in sobreposicoes:
+                writer.writerow([a, "sobrepoe", b])
+
+    if verbose:
+        msg = f"  ✓ Relatório gravado em '{caminho}' ({n} cerca(s))."
+        if sobreposicoes:
+            msg += f"  ⚠ {len(sobreposicoes)} sobreposição(ões) detectada(s) — ver relatório."
+        print(msg)
+
+    return n
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -796,6 +1010,11 @@ def main():
     parser.add_argument("--silencioso", action="store_true",
                         help="Suprime mensagens de progresso.")
 
+    parser.add_argument("--relatorio", default=None,
+                        help="Caminho de um relatório CSV com o resumo das cercas geradas "
+                             "e alertas de sobreposição entre polígonos (não bloqueante). "
+                             "Opcional; se omitido, nenhum relatório é gerado. [FAT-78, S5/S3]")
+
     args    = parser.parse_args()
     verbose = not args.silencioso
 
@@ -812,7 +1031,10 @@ def main():
         if verbose:
             print(f"\n[MÓDULO 1B] Lendo arquivo de lote '{args.batch}'...  [FAT-63]")
         try:
-            n = processar_lote(args.batch, caminho_saida, verbose=verbose)
+            n, _registros, _sobreposicoes = processar_lote(
+                args.batch, caminho_saida, verbose=verbose,
+                caminho_relatorio=args.relatorio,
+            )
         except (ValueError, RuntimeError) as e:
             print(f"\nERRO no processamento do lote: {e}", file=sys.stderr)
             sys.exit(1)
@@ -900,17 +1122,21 @@ def main():
     if verbose:
         print("\n[MÓDULO 3/4] Recortando trecho e gerando variantes...")
 
-    cercas = gerar_cercas(
-        polilinha     = polilinha,
-        modo          = args.modo,
-        inicio        = inicio,
-        fim           = fim,
-        comprimento_m = args.comprimento if args.modo == "B" else None,
-        pre_m         = args.pre,
-        pos_m         = args.pos,
-        buffer_m      = args.buffer,
-        verbose       = verbose,
-    )
+    try:
+        cercas = gerar_cercas(
+            polilinha     = polilinha,
+            modo          = args.modo,
+            inicio        = inicio,
+            fim           = fim,
+            comprimento_m = args.comprimento if args.modo == "B" else None,
+            pre_m         = args.pre,
+            pos_m         = args.pos,
+            buffer_m      = args.buffer,
+            verbose       = verbose,
+        )
+    except ValueError as e:
+        print(f"\nERRO: {e}", file=sys.stderr)
+        sys.exit(1)
 
     if verbose:
         for chave, dados in cercas.items():
@@ -942,6 +1168,24 @@ def main():
 
     if erros:
         sys.exit(2)
+
+    if args.relatorio:
+        registros_relatorio: List[Dict] = []
+        for chave, dados in cercas.items():
+            verts = dados.get("vertices", [])
+            if not verts:
+                continue
+            codigo = _montar_codigo(chave, args.rodovia, args.cidade, args.uf, args.velocidade, args.seq)
+            registros_relatorio.append({
+                "codigo": codigo, "tipo": chave, "seq": args.seq,
+                "vertices": verts, "extensao_m": dados.get("extensao_m", 0),
+            })
+        if verbose:
+            print(f"\n[MÓDULO 7] Verificando sobreposição entre polígonos...  [FAT-78, S3]")
+        sobreposicoes = detectar_sobreposicao(registros_relatorio)
+        if verbose:
+            print(f"\n[MÓDULO 8] Gerando relatório '{args.relatorio}'...  [FAT-78, S5]")
+        gerar_relatorio(registros_relatorio, args.relatorio, sobreposicoes, verbose=verbose)
 
     if verbose:
         print(f"\n{'='*60}")
