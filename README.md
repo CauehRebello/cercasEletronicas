@@ -133,26 +133,6 @@ Se um CÓDIGO já existir no histórico (de uma execução anterior), é emitido
 um alerta não bloqueante — a execução **não** é interrompida. Consultas
 programáticas por rodovia, UF ou código: `cercas_v2.consultar_historico(caminho_db, filtros)`.
 
-## Processamento paralelo do lote
-
-Processa as linhas do `--batch` concorrentemente (útil quando a maior parte
-do tempo é gasta esperando o Overpass API responder). Desabilitado por
-padrão — sem `--paralelo`, o processamento é sequencial, idêntico ao
-comportamento anterior. A ordem de saída é sempre a do arquivo de lote,
-independente da ordem em que as threads terminam.
-
-| Flag | Descrição | Padrão |
-|---|---|---|
-| `--paralelo` | Habilita o processamento concorrente (`ThreadPoolExecutor`) | desabilitado |
-| `--paralelo-workers <n>` | Número máximo de threads | `4` |
-
-```bash
-python cercas_v2.py --batch lote_modelo.csv --saida saida_lote.csv --paralelo --paralelo-workers 4
-```
-
-Combine com `--cache` para reduzir chamadas de rede duplicadas quando várias
-linhas do lote referenciam a mesma via/bbox.
-
 ## Testes
 
 ```bash
