@@ -53,6 +53,7 @@ import re
 import sqlite3
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
@@ -932,6 +933,8 @@ def processar_lote(
     usar_cache: bool = False,
     cache_ttl_s: float = 86400,
     caminho_historico: Optional[str] = None,
+    paralelo: bool = False,
+    max_workers: int = 4,
 ) -> Tuple[int, List[Dict], List[Tuple[str, str]]]:
     """
     Lê o arquivo de lote, gera todas as cercas e exporta UM único arquivo
@@ -953,6 +956,14 @@ def processar_lote(
     `caminho_historico`: se informado, grava `todos_registros` em um banco
     SQLite persistente entre execuções (`salvar_no_historico`).  Opcional;
     se omitido, nenhuma persistência ocorre.  [FAT-155, S5]
+
+    `paralelo`/`max_workers`: se `paralelo=True`, processa as linhas do lote
+    concorrentemente em até `max_workers` threads (útil quando a maior parte
+    do tempo é gasta esperando o Overpass API). Desabilitado por padrão —
+    sem `paralelo`, o processamento é sequencial, idêntico ao comportamento
+    anterior. Em ambos os casos, `todas_linhas`/`todos_registros` preservam
+    a ordem original das linhas do arquivo de lote, e o primeiro erro na
+    ordem do arquivo é o que se propaga (mesma semântica de R6/R2).  [S9]
     """
     linhas_lote = ler_lote(caminho_entrada)
     if verbose:
@@ -960,14 +971,33 @@ def processar_lote(
 
     todas_linhas: List[str] = []
     todos_registros: List[Dict] = []
-    for row in linhas_lote:
-        linhas_sascar, registros = processar_linha_lote(
-            row, verbose=verbose,
-            max_tentativas=max_tentativas, espera_base_s=espera_base_s, timeout_s=timeout_s,
-            usar_cache=usar_cache, cache_ttl_s=cache_ttl_s,
-        )
-        todas_linhas.extend(linhas_sascar)
-        todos_registros.extend(registros)
+
+    if paralelo:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [
+                executor.submit(
+                    processar_linha_lote, row, verbose=verbose,
+                    max_tentativas=max_tentativas, espera_base_s=espera_base_s, timeout_s=timeout_s,
+                    usar_cache=usar_cache, cache_ttl_s=cache_ttl_s,
+                )
+                for row in linhas_lote
+            ]
+            # `future.result()` na ordem de submissão (= ordem do arquivo) —
+            # preserva ordem de saída e propaga o primeiro erro por linha,
+            # não por ordem de conclusão das threads.
+            for future in futures:
+                linhas_sascar, registros = future.result()
+                todas_linhas.extend(linhas_sascar)
+                todos_registros.extend(registros)
+    else:
+        for row in linhas_lote:
+            linhas_sascar, registros = processar_linha_lote(
+                row, verbose=verbose,
+                max_tentativas=max_tentativas, espera_base_s=espera_base_s, timeout_s=timeout_s,
+                usar_cache=usar_cache, cache_ttl_s=cache_ttl_s,
+            )
+            todas_linhas.extend(linhas_sascar)
+            todos_registros.extend(registros)
 
     total = exportar_lote(todas_linhas, caminho_saida, verbose=verbose)
 
@@ -1339,6 +1369,13 @@ def main():
                              "registradas entre execuções distintas. Opcional; se omitido, "
                              "nenhuma persistência ocorre. [S5]")
 
+    # Processamento paralelo do lote  [S9]
+    parser.add_argument("--paralelo", action="store_true",
+                        help="Processa as linhas do --batch concorrentemente (ThreadPoolExecutor). "
+                             "Desabilitado por padrão (processamento sequencial). [S9]")
+    parser.add_argument("--paralelo-workers", type=int, default=4,
+                        help="Número máximo de threads quando --paralelo está ativo. Padrão: 4. [S9]")
+
     args    = parser.parse_args()
     verbose = not args.silencioso
 
@@ -1364,6 +1401,8 @@ def main():
                 usar_cache=args.cache,
                 cache_ttl_s=args.cache_ttl,
                 caminho_historico=args.historico,
+                paralelo=args.paralelo,
+                max_workers=args.paralelo_workers,
             )
         except (ValueError, RuntimeError) as e:
             print(f"\nERRO no processamento do lote: {e}", file=sys.stderr)

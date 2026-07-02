@@ -30,6 +30,7 @@ from cercas_v2 import (
     ler_lote,
     parse_coord,
     parse_polilinha_manual,
+    processar_lote,
     salvar_no_historico,
     validar_csv,
 )
@@ -584,3 +585,60 @@ def test_consultar_historico_filtra_por_rodovia_uf_codigo(tmp_path):
 
 def test_consultar_historico_sem_arquivo_retorna_lista_vazia(tmp_path):
     assert consultar_historico(str(tmp_path / "nao_existe.db")) == []
+
+
+# ── Módulo 1B: processamento paralelo do lote [S9] ───────────────────────────
+
+_POLI_STR = ";".join(f"{lat},{lon}" for lat, lon in _POLY)
+
+def _escrever_lote_paralelo(tmp_path, n_linhas, comprimento_invalido_na_linha=None):
+    """Monta um lote de `n_linhas` cercas Modo A, todas usando a mesma
+    polilinha manual (_POLY) — sem depender de rede/OSM. Se
+    `comprimento_invalido_na_linha` for informado (1-based), essa linha
+    vira Modo B com comprimento maior que a via (força ValueError FAT-81,
+    igual a `test_gerar_cercas_modo_b_comprimento_maior_que_via`)."""
+    linhas = [_CABECALHO_LOTE]
+    for i in range(1, n_linhas + 1):
+        if i == comprimento_invalido_na_linha:
+            linhas.append(
+                f',"{_POLI_STR}",B,"{_INICIO[0]},{_INICIO[1]}",,50000,0,0,50,'
+                f'BR-TEST,CIDADE{i},SC,60,{i:03d}\n'
+            )
+        else:
+            linhas.append(
+                f',"{_POLI_STR}",A,"{_INICIO[0]},{_INICIO[1]}","{_FIM[0]},{_FIM[1]}",,0,0,50,'
+                f'BR-TEST,CIDADE{i},SC,60,{i:03d}\n'
+            )
+    caminho_entrada = tmp_path / "lote.csv"
+    caminho_entrada.write_text("".join(linhas), encoding="utf-8")
+    return str(caminho_entrada)
+
+def test_processar_lote_paralelo_preserva_ordem_igual_ao_sequencial(tmp_path):
+    caminho_entrada = _escrever_lote_paralelo(tmp_path, 5)
+
+    _, registros_seq, _ = processar_lote(
+        caminho_entrada, str(tmp_path / "seq.csv"), verbose=False, paralelo=False,
+    )
+    _, registros_par, _ = processar_lote(
+        caminho_entrada, str(tmp_path / "par.csv"), verbose=False,
+        paralelo=True, max_workers=4,
+    )
+
+    assert [r["codigo"] for r in registros_seq] == [r["codigo"] for r in registros_par]
+    assert len(registros_seq) == 5  # só PRI gerada (pre=pos=0)
+
+def test_processar_lote_paralelo_default_desabilitado():
+    import inspect
+    assert inspect.signature(processar_lote).parameters["paralelo"].default is False
+
+def test_processar_lote_paralelo_propaga_mesmo_erro_que_sequencial(tmp_path):
+    caminho_entrada = _escrever_lote_paralelo(tmp_path, 3, comprimento_invalido_na_linha=2)
+
+    with pytest.raises(ValueError, match="FAT-81"):
+        processar_lote(caminho_entrada, str(tmp_path / "seq.csv"), verbose=False, paralelo=False)
+
+    with pytest.raises(ValueError, match="FAT-81"):
+        processar_lote(
+            caminho_entrada, str(tmp_path / "par.csv"), verbose=False,
+            paralelo=True, max_workers=4,
+        )
