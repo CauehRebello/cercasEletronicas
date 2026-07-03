@@ -143,20 +143,36 @@ base central PostgreSQL — se já existir ativo, a execução é **recusada**
 | Flag | Descrição | Padrão |
 |---|---|---|
 | `--pg-dsn <dsn>` | String de conexão (formato libpq) da base central | nenhuma checagem central |
+| `--pg-fake` | Liga o Bloco A com uma conexão central EM MEMÓRIA (demonstração/teste, sem PostgreSQL) — mutuamente exclusivo com `--pg-dsn` | desabilitado |
 | `--substituir` | Declara intenção de reemitir sob o mesmo CÓDIGO/SEQ | desabilitado |
 | `--confirmar-substituicao` | Confirma a substituição declarada em `--substituir` | desabilitado |
 | `--motivo-substituicao <texto>` | Motivo opcional registrado com a substituição | nenhum |
 
 ```bash
 python cercas_v2.py --batch lote_modelo.csv --saida saida_lote.csv \
-  --pg-dsn "host=meuservidor dbname=cercas user=cercas_app password=***"
+  --pg-dsn "host=meuservidor dbname=cercas user=cercas_app"
 ```
 
-Para reemitir intencionalmente sob o mesmo CÓDIGO (ex.: correção de uma
-cerca já publicada), use `--substituir` **junto com** `--confirmar-substituicao`
-— o registro antigo é marcado como `superado` na base central, nunca
-apagado. Requer a dependência `psycopg2-binary` (em `requirements.txt`),
-carregada apenas quando `--pg-dsn` é usado.
+A senha nunca vai na DSN em texto plano: se `--pg-dsn` não incluir
+`password=`, ela é lida da variável de ambiente `CERCAS_DB_PASSWORD` (ver
+`.env.example`). Para reemitir intencionalmente sob o mesmo CÓDIGO (ex.:
+correção de uma cerca já publicada), use `--substituir` **junto com**
+`--confirmar-substituicao` — o registro antigo é marcado como `superado` na
+base central, nunca apagado. Requer a dependência `psycopg2-binary` (em
+`requirements.txt`), carregada apenas quando `--pg-dsn`/`--pg-fake` é usado.
+
+**Modo demonstração sem PostgreSQL:** `--pg-fake` liga o Bloco A com uma
+conexão em memória, não persistente e não compartilhada entre processos —
+**nunca usar em produção** (não cumpre o requisito de checagem central).
+Útil só para testar o fluxo de bloqueio/substituição localmente.
+
+**Testes de integração contra PostgreSQL real:** `test_cercas_pg_integration.py`
+roda as mesmas funções do Bloco A contra um banco de verdade, definido por
+`CERCAS_TEST_PG_DSN` (ver `.env.example`); é pulado automaticamente se essa
+variável não estiver definida. Requer que o usuário da DSN tenha privilégio
+`CREATE` no schema `public` do banco (no PostgreSQL 15+, isso não é mais
+concedido por padrão — rode `GRANT CREATE ON SCHEMA public TO <usuario>;`
+como superusuário/dono do banco se aparecer `InsufficientPrivilege`).
 
 ## Bloco B v4 — bloqueio de sobreposição geométrica
 

@@ -14,6 +14,7 @@ from cercas_v2 import (
     _COSTURA_DIST_MAX_M,
     LIMIAR_SOBREPOSICAO_BLOQUEIO_PADRAO,
     DuplicidadeCodigoCentralError,
+    _FakeCentralConn,
     _cache_get,
     _cache_key,
     _cache_set,
@@ -676,89 +677,13 @@ def test_gerar_relatorio_com_bloqueios_sobreposicao():
 
 # ── Bloco A v4: duplicidade de CÓDIGO contra base central [FAT-181/182/183] ──
 #
-# `psycopg2` real não é usado nestes testes: as funções recebem uma conexão
-# já aberta como parâmetro, então usamos uma conexão/cursor "fake" em
-# memória que imita apenas o subconjunto da API usado pelo código (cursor(),
-# execute(sql, params), fetchone(), fetchall(), rowcount, commit(), close()).
-# Isso cobre a lógica de negócio (checagem, sugestão de SEQ, substituição),
-# mas NÃO valida a conexão real com um servidor PostgreSQL — não há
-# servidor disponível neste ambiente.
-
-class _FakeCentralCursor:
-    def __init__(self, conn):
-        self._conn = conn
-        self._resultado = []
-        self.rowcount = 0
-
-    def execute(self, sql, params=()):
-        s = sql.strip()
-        if s.startswith("CREATE TABLE"):
-            return
-        if s.startswith("SELECT codigo"):
-            rodovia, cidade, uf, velocidade, seq = params
-            self._resultado = [
-                (r["codigo"], r["tipo"], r["rodovia"], r["cidade"], r["uf"],
-                 r["velocidade"], r["seq"], r["execucao_id"])
-                for r in self._conn.rows
-                if r["rodovia"] == rodovia and r["cidade"] == cidade and r["uf"] == uf
-                and r["velocidade"] == velocidade and r["seq"] == seq and r["status"] == "ativo"
-            ]
-            return
-        if s.startswith("SELECT seq"):
-            rodovia, cidade, uf, velocidade = params
-            self._resultado = [
-                (r["seq"],) for r in self._conn.rows
-                if r["rodovia"] == rodovia and r["cidade"] == cidade and r["uf"] == uf
-                and r["velocidade"] == velocidade
-            ]
-            return
-        if s.startswith("UPDATE"):
-            timestamp, motivo, rodovia, cidade, uf, velocidade, seq = params
-            n = 0
-            for r in self._conn.rows:
-                if (r["rodovia"] == rodovia and r["cidade"] == cidade and r["uf"] == uf
-                        and r["velocidade"] == velocidade and r["seq"] == seq
-                        and r["status"] == "ativo"):
-                    r["status"] = "superado"
-                    r["superado_em"] = timestamp
-                    r["superado_motivo"] = motivo
-                    n += 1
-            self.rowcount = n
-            return
-        if s.startswith("INSERT"):
-            (codigo, tipo, rodovia, cidade, uf, velocidade, seq, extensao_m,
-             v_ini, v_fim, num_vertices, data_criacao, execucao_id) = params
-            self._conn.rows.append({
-                "codigo": codigo, "tipo": tipo, "rodovia": rodovia, "cidade": cidade,
-                "uf": uf, "velocidade": velocidade, "seq": seq, "extensao_m": extensao_m,
-                "vertice_inicial": v_ini, "vertice_final": v_fim, "num_vertices": num_vertices,
-                "data_criacao": data_criacao, "execucao_id": execucao_id,
-                "status": "ativo", "superado_em": None, "superado_motivo": None,
-            })
-            return
-        raise AssertionError(f"SQL não esperado no fake de teste: {sql}")
-
-    def fetchone(self):
-        return self._resultado[0] if self._resultado else None
-
-    def fetchall(self):
-        return self._resultado
-
-
-class _FakeCentralConn:
-    def __init__(self):
-        self.rows = []
-        self.commits = 0
-
-    def cursor(self):
-        return _FakeCentralCursor(self)
-
-    def commit(self):
-        self.commits += 1
-
-    def close(self):
-        pass
-
+# `psycopg2` real não é usado nestes testes unitários: as funções recebem
+# uma conexão já aberta como parâmetro, então usamos `_FakeCentralConn`
+# (importada de `cercas_v2` — mesma classe usada em produção pelo modo
+# `--pg-fake`) para cobrir a lógica de negócio (checagem, sugestão de SEQ,
+# substituição) sem depender de infraestrutura externa. A validação contra
+# um PostgreSQL real está em `test_cercas_pg_integration.py` (pulado se
+# `CERCAS_TEST_PG_DSN` não estiver definida).
 
 def _registro_central(seq=1, codigo=None):
     codigo = codigo or f"PRI - BR-116 - LUZ_MG - 60 KmH - {seq:03d}"

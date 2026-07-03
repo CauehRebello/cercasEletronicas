@@ -960,6 +960,7 @@ def processar_lote(
     cache_ttl_s: float = 86400,
     caminho_historico: Optional[str] = None,
     pg_dsn: Optional[str] = None,
+    pg_fake: bool = False,
     substituir: bool = False,
     confirmar_substituicao: bool = False,
     motivo_substituicao: Optional[str] = None,
@@ -997,6 +998,8 @@ def processar_lote(
     de gerar geometria; `substituir`/`confirmar_substituicao`/
     `motivo_substituicao` controlam a substituição intencional. Ao final,
     as cercas geradas são registradas como ativas na base central.
+    `pg_fake`: usa a conexão em memória (`_FakeCentralConn`) em vez de
+    PostgreSQL real — só para demonstração/teste, nunca em produção.
     `limiar_sobreposicao`/`overrides_sobreposicao` (Bloco B v4, [FAT-203,
     FAT-185, FAT-186]) controlam o bloqueio de sobreposição geométrica.
     """
@@ -1004,7 +1007,7 @@ def processar_lote(
     if verbose:
         print(f"  ✓ {len(linhas_lote)} cerca(s) no arquivo de lote '{caminho_entrada}'.")
 
-    pg_conn = _pg_conectar(pg_dsn) if pg_dsn else None
+    pg_conn = _obter_conexao_central(pg_dsn, usar_fake=pg_fake, verbose=verbose) if (pg_dsn or pg_fake) else None
     try:
         if pg_conn is not None:
             _pg_criar_tabela(pg_conn)
@@ -1445,12 +1448,122 @@ def _pg_conectar(dsn: str):
     Abre uma conexão com a base central PostgreSQL. [FAT-202]
     Import de `psycopg2` é preguiçoso — só é exigido quando esta função é
     de fato chamada (--pg-dsn informado).
+
+    Se `dsn` não contiver `password=` e a variável de ambiente
+    `CERCAS_DB_PASSWORD` estiver definida, a senha é acrescentada à DSN a
+    partir dela — nunca hard-coded, nunca logada. Se a env var não estiver
+    definida, comportamento idêntico ao anterior (senha só vem da própria
+    `dsn`, se houver).
     """
     import psycopg2
+    if "password=" not in dsn and os.environ.get("CERCAS_DB_PASSWORD"):
+        dsn = f"{dsn} password={os.environ['CERCAS_DB_PASSWORD']}"
     try:
         return psycopg2.connect(dsn)
     except Exception as e:
         raise RuntimeError(f"Falha ao conectar à base central PostgreSQL (--pg-dsn): {e}") from e
+
+
+class _FakeCentralCursor:
+    """
+    Cursor "fake" em memória, imitando apenas o subconjunto da API do
+    psycopg2 usado por este módulo (execute/fetchone/fetchall/rowcount).
+    Usado tanto pelo modo `--pg-fake` (demonstração/teste manual sem
+    PostgreSQL) quanto pelos testes unitários do Bloco A.
+
+    ATENÇÃO: não é persistente nem compartilhado entre processos — NÃO
+    cumpre o requisito de checagem central (FAT-183). Nunca usar como
+    substituto de um PostgreSQL real em produção.
+    """
+    def __init__(self, conn):
+        self._conn = conn
+        self._resultado = []
+        self.rowcount = 0
+
+    def execute(self, sql, params=()):
+        s = sql.strip()
+        if s.startswith("CREATE TABLE"):
+            return
+        if s.startswith("SELECT codigo"):
+            rodovia, cidade, uf, velocidade, seq = params
+            self._resultado = [
+                (r["codigo"], r["tipo"], r["rodovia"], r["cidade"], r["uf"],
+                 r["velocidade"], r["seq"], r["execucao_id"])
+                for r in self._conn.rows
+                if r["rodovia"] == rodovia and r["cidade"] == cidade and r["uf"] == uf
+                and r["velocidade"] == velocidade and r["seq"] == seq and r["status"] == "ativo"
+            ]
+            return
+        if s.startswith("SELECT seq"):
+            rodovia, cidade, uf, velocidade = params
+            self._resultado = [
+                (r["seq"],) for r in self._conn.rows
+                if r["rodovia"] == rodovia and r["cidade"] == cidade and r["uf"] == uf
+                and r["velocidade"] == velocidade
+            ]
+            return
+        if s.startswith("UPDATE"):
+            timestamp, motivo, rodovia, cidade, uf, velocidade, seq = params
+            n = 0
+            for r in self._conn.rows:
+                if (r["rodovia"] == rodovia and r["cidade"] == cidade and r["uf"] == uf
+                        and r["velocidade"] == velocidade and r["seq"] == seq
+                        and r["status"] == "ativo"):
+                    r["status"] = "superado"
+                    r["superado_em"] = timestamp
+                    r["superado_motivo"] = motivo
+                    n += 1
+            self.rowcount = n
+            return
+        if s.startswith("INSERT"):
+            (codigo, tipo, rodovia, cidade, uf, velocidade, seq, extensao_m,
+             v_ini, v_fim, num_vertices, data_criacao, execucao_id) = params
+            self._conn.rows.append({
+                "codigo": codigo, "tipo": tipo, "rodovia": rodovia, "cidade": cidade,
+                "uf": uf, "velocidade": velocidade, "seq": seq, "extensao_m": extensao_m,
+                "vertice_inicial": v_ini, "vertice_final": v_fim, "num_vertices": num_vertices,
+                "data_criacao": data_criacao, "execucao_id": execucao_id,
+                "status": "ativo", "superado_em": None, "superado_motivo": None,
+            })
+            return
+        raise AssertionError(f"SQL não esperado no _FakeCentralConn: {sql}")
+
+    def fetchone(self):
+        return self._resultado[0] if self._resultado else None
+
+    def fetchall(self):
+        return self._resultado
+
+
+class _FakeCentralConn:
+    """Conexão "fake" em memória — ver aviso em `_FakeCentralCursor`."""
+    def __init__(self):
+        self.rows = []
+        self.commits = 0
+
+    def cursor(self):
+        return _FakeCentralCursor(self)
+
+    def commit(self):
+        self.commits += 1
+
+    def close(self):
+        pass
+
+
+def _obter_conexao_central(dsn: Optional[str], usar_fake: bool = False, verbose: bool = True):
+    """
+    Escolhe a conexão da base central: fake em memória (`--pg-fake`,
+    demonstração/teste sem PostgreSQL) ou PostgreSQL real (`--pg-dsn`).
+    Nunca as duas ao mesmo tempo — validado antes, em `main()`.
+    """
+    if usar_fake:
+        if verbose:
+            print("  ⚠ Modo --pg-fake: conexão central EM MEMÓRIA, não persistente "
+                  "e não compartilhada entre processos — apenas para demonstração/teste, "
+                  "NÃO é uma base central real. [Bloco A v4]")
+        return _FakeCentralConn()
+    return _pg_conectar(dsn)
 
 
 def _pg_criar_tabela(conn) -> None:
@@ -1715,10 +1828,18 @@ def main():
     # [FAT-181, FAT-182, FAT-183, FAT-202]
     parser.add_argument("--pg-dsn", default=None,
                         help="String de conexão (DSN libpq) da base central PostgreSQL "
-                             "usada para bloquear duplicidade de CÓDIGO. Opcional; se "
-                             "omitido, esta checagem central fica desligada (o histórico "
-                             "local em --historico continua funcionando normalmente, "
-                             "sem bloquear). [FAT-183, FAT-202, Bloco A v4]")
+                             "usada para bloquear duplicidade de CÓDIGO. A senha pode vir "
+                             "embutida na DSN ou, se omitida, é lida da variável de ambiente "
+                             "CERCAS_DB_PASSWORD (nunca hard-coded). Opcional; se omitido (e "
+                             "--pg-fake também), esta checagem central fica desligada (o "
+                             "histórico local em --historico continua funcionando "
+                             "normalmente, sem bloquear). [FAT-183, FAT-202, Bloco A v4]")
+    parser.add_argument("--pg-fake", action="store_true",
+                        help="Liga o Bloco A com uma conexão central EM MEMÓRIA, não "
+                             "persistente e não compartilhada entre processos — apenas para "
+                             "demonstração/teste sem PostgreSQL disponível. Mutuamente "
+                             "exclusivo com --pg-dsn. NUNCA usar em produção real (não cumpre "
+                             "checagem central de fato, FAT-183). [Bloco A v4]")
     parser.add_argument("--substituir", action="store_true",
                         help="Declara intenção de reemitir uma cerca sob o mesmo CÓDIGO/SEQ "
                              "já ativo na base central. Requer --confirmar-substituicao. "
@@ -1751,6 +1872,9 @@ def main():
 
     args    = parser.parse_args()
     verbose = not args.silencioso
+
+    if args.pg_dsn and args.pg_fake:
+        parser.error("--pg-dsn e --pg-fake são mutuamente exclusivos. [Bloco A v4]")
 
     overrides_sobreposicao: Dict[Tuple[str, str], Dict] = {}
     for item in (args.override_sobreposicao or []):
@@ -1791,6 +1915,7 @@ def main():
                 cache_ttl_s=args.cache_ttl,
                 caminho_historico=args.historico,
                 pg_dsn=args.pg_dsn,
+                pg_fake=args.pg_fake,
                 substituir=args.substituir,
                 confirmar_substituicao=args.confirmar_substituicao,
                 motivo_substituicao=args.motivo_substituicao,
@@ -1878,10 +2003,10 @@ def main():
 
     # ── Bloco A v4: duplicidade de CÓDIGO contra base central ────────────────
     # [FAT-181, FAT-182, FAT-183, FAT-202] — checada antes do Módulo 2 (falha
-    # rápida, sem custo de consulta OSM) quando --pg-dsn é informado.
-    if args.pg_dsn:
+    # rápida, sem custo de consulta OSM) quando --pg-dsn ou --pg-fake é informado.
+    if args.pg_dsn or args.pg_fake:
         try:
-            pg_conn = _pg_conectar(args.pg_dsn)
+            pg_conn = _obter_conexao_central(args.pg_dsn, usar_fake=args.pg_fake, verbose=verbose)
         except RuntimeError as e:
             print(f"\nERRO: {e}", file=sys.stderr)
             sys.exit(1)
@@ -1976,7 +2101,7 @@ def main():
     if erros:
         sys.exit(2)
 
-    if args.relatorio or args.historico or args.pg_dsn:
+    if args.relatorio or args.historico or args.pg_dsn or args.pg_fake:
         registros_relatorio: List[Dict] = []
         for chave, dados in cercas.items():
             verts = dados.get("vertices", [])
@@ -2003,11 +2128,11 @@ def main():
                 print(f"\n[MÓDULO 9] Gravando histórico '{args.historico}'...  [FAT-155, S5]")
             salvar_no_historico(registros_relatorio, args.historico, verbose=verbose)
 
-        if args.pg_dsn:
+        if args.pg_dsn or args.pg_fake:
             if verbose:
                 print(f"\n[MÓDULO 9] Registrando na base central (Bloco A v4)...  "
                       f"[FAT-181, FAT-183]")
-            pg_conn = _pg_conectar(args.pg_dsn)
+            pg_conn = _obter_conexao_central(args.pg_dsn, usar_fake=args.pg_fake, verbose=False)
             execucao_id_central = datetime.now().strftime("%Y%m%d%H%M%S")
             try:
                 for registro in registros_relatorio:
