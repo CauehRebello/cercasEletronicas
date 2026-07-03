@@ -80,6 +80,39 @@ class CercasGUI(tk.Tk):
         linha += 1
         linha = self._campo_arquivo(container, linha, "historico", "Banco de histórico (.db)", salvar=True)
 
+        ttk.Label(container, text="Base central — duplicidade de CÓDIGO (Bloco A v4)").grid(
+            row=linha, column=0, sticky="w", pady=(8, 0)
+        )
+        linha += 1
+        linha = self._campo_texto(container, linha, "pg_dsn", "DSN PostgreSQL (--pg-dsn)")
+        self.campos["substituir"] = tk.BooleanVar(value=False)
+        ttk.Checkbutton(container, text="Substituir cerca existente (--substituir)",
+                        variable=self.campos["substituir"]).grid(
+            row=linha, column=0, columnspan=2, sticky="w"
+        )
+        linha += 1
+        self.campos["confirmar_substituicao"] = tk.BooleanVar(value=False)
+        ttk.Checkbutton(container, text="Confirmar substituição (--confirmar-substituicao)",
+                        variable=self.campos["confirmar_substituicao"]).grid(
+            row=linha, column=0, columnspan=2, sticky="w"
+        )
+        linha += 1
+        linha = self._campo_texto(container, linha, "motivo_substituicao", "Motivo da substituição (opcional)")
+
+        ttk.Label(container, text="Sobreposição geométrica (Bloco B v4)").grid(
+            row=linha, column=0, sticky="w", pady=(8, 0)
+        )
+        linha += 1
+        linha = self._campo_texto(container, linha, "limiar_sobreposicao",
+                                   "Limiar de bloqueio (0–1, padrão 0.90)")
+        ttk.Label(container, text="Overrides (1 por linha: CODIGO:CODIGO:justificativa)").grid(
+            row=linha, column=0, sticky="w"
+        )
+        linha += 1
+        self.overrides_texto = scrolledtext.ScrolledText(container, width=60, height=3)
+        self.overrides_texto.grid(row=linha, column=0, columnspan=3, sticky="we", padx=4)
+        linha += 1
+
         botoes = ttk.Frame(container)
         botoes.grid(row=linha, column=0, columnspan=3, pady=10, sticky="w")
         ttk.Button(botoes, text="Gerar cerca(s)", command=self._executar).pack(side="left")
@@ -182,6 +215,19 @@ class CercasGUI(tk.Tk):
             argv.append("--cache")
         add("--cache-ttl", "cache_ttl")
         add("--historico", "historico")
+
+        add("--pg-dsn", "pg_dsn")
+        if self.campos["substituir"].get():
+            argv.append("--substituir")
+        if self.campos["confirmar_substituicao"].get():
+            argv.append("--confirmar-substituicao")
+        add("--motivo-substituicao", "motivo_substituicao")
+
+        add("--limiar-sobreposicao", "limiar_sobreposicao")
+        for linha_override in self.overrides_texto.get("1.0", tk.END).splitlines():
+            linha_override = linha_override.strip()
+            if linha_override:
+                argv.extend(["--override-sobreposicao", linha_override])
 
         return argv
 

@@ -45,6 +45,7 @@ Fluxo (6 módulos):
 
 import argparse
 import csv
+import getpass
 import hashlib
 import json
 import math
@@ -216,6 +217,13 @@ OVERPASS_TIMEOUT = 30
 # Distância máxima (m) de início/fim ao componente escolhido — 2x o buffer_m
 # padrão (50 m). Acima disso, a via encontrada não é a pedida.  [FAT-68, DEC-6]
 _COSTURA_DIST_MAX_M = 100.0
+
+# Limiar de bloqueio de sobreposição geométrica (Bloco B v4, Módulo 7).
+# Definido aqui (constantes de módulo) para estar disponível como valor
+# default de `processar_lote` mais abaixo. PROVISÓRIO, sem validação
+# empírica — deixado parametrizável via --limiar-sobreposicao.
+# [FAT-203, FAT-195, Bloco B v4]
+LIMIAR_SOBREPOSICAO_BLOQUEIO_PADRAO = 0.90
 
 
 def _haversine_m(p1: Tuple[float, float], p2: Tuple[float, float]) -> float:
@@ -839,6 +847,10 @@ def processar_linha_lote(
     timeout_s: int = OVERPASS_TIMEOUT,
     usar_cache: bool = False,
     cache_ttl_s: float = 86400,
+    pg_conn=None,
+    substituir: bool = False,
+    confirmar_substituicao: bool = False,
+    motivo_substituicao: Optional[str] = None,
 ) -> Tuple[List[str], List[Dict]]:
     """
     Processa UMA linha do arquivo de lote: geometria → buffer/recorte →
@@ -854,6 +866,13 @@ def processar_linha_lote(
     `max_tentativas`, `espera_base_s` e `timeout_s` são repassados a
     `buscar_geometria_osm` (padrões idênticos ao comportamento anterior).  [FAT-119, S7]
     `usar_cache`/`cache_ttl_s` idem, para o cache local de geometrias.  [FAT-154, S4]
+
+    `pg_conn` (Bloco A v4, [FAT-181, FAT-182]): se informado (conexão já
+    aberta com a base central), checa duplicidade de CÓDIGO ANTES de buscar
+    geometria (falha rápida, sem custo de rede) — levanta
+    `DuplicidadeCodigoCentralError` se já existir CÓDIGO ativo para a mesma
+    combinação rodovia/cidade/UF/velocidade/SEQ e a substituição
+    (`substituir` + `confirmar_substituicao`) não tiver sido solicitada.
     """
     num_linha = row.get("_num_linha", "?")
 
@@ -864,6 +883,7 @@ def processar_linha_lote(
     pre_m   = float(row["pre"]) if row.get("pre") else 0.0
     pos_m   = float(row["pos"]) if row.get("pos") else 0.0
     buffer_m = float(row["buffer"]) if row.get("buffer") else 50.0
+    seq     = int(row["seq"])
 
     if modo == "A" and fim is None:
         raise ValueError(f"Lote, linha {num_linha}: modo A requer coluna 'fim'.")
@@ -872,6 +892,14 @@ def processar_linha_lote(
 
     if verbose:
         print(f"\n[LOTE — linha {num_linha}] modo {modo} | seq {row['seq']}")
+
+    if pg_conn is not None:
+        _checar_duplicidade_central(
+            pg_conn, row["rodovia"], row["cidade"], row["uf"], int(row["velocidade"]), seq,
+            substituir=substituir, confirmar_substituicao=confirmar_substituicao,
+            motivo_substituicao=motivo_substituicao,
+            identificador=f"linha {num_linha}",
+        )
 
     via       = (row.get("via") or "").strip()
     polilinha_manual = (row.get("polilinha") or "").strip()
@@ -897,7 +925,6 @@ def processar_linha_lote(
         buffer_m=buffer_m, verbose=verbose,
     )
 
-    seq = int(row["seq"])
     linhas_sascar = _montar_linhas_cerca(
         cercas=cercas,
         rodovia=row["rodovia"], cidade=row["cidade"], uf=row["uf"],
@@ -932,11 +959,17 @@ def processar_lote(
     usar_cache: bool = False,
     cache_ttl_s: float = 86400,
     caminho_historico: Optional[str] = None,
-) -> Tuple[int, List[Dict], List[Tuple[str, str]]]:
+    pg_dsn: Optional[str] = None,
+    substituir: bool = False,
+    confirmar_substituicao: bool = False,
+    motivo_substituicao: Optional[str] = None,
+    limiar_sobreposicao: float = LIMIAR_SOBREPOSICAO_BLOQUEIO_PADRAO,
+    overrides_sobreposicao: Optional[Dict[Tuple[str, str], Dict]] = None,
+) -> Tuple[int, List[Dict], List[Tuple[str, str]], List[Dict]]:
     """
     Lê o arquivo de lote, gera todas as cercas e exporta UM único arquivo
     consolidado.  [FAT-63, DEC-3]
-    Retorna (total_gravado, registros_estruturados, sobreposicoes):
+    Retorna (total_gravado, registros_estruturados, sobreposicoes, bloqueios_sobreposicao):
       - total_gravado: número de registros SASCAR gravados (comportamento
         original, inalterado).
       - registros_estruturados: dados de cada cerca (codigo/tipo/seq/
@@ -944,8 +977,13 @@ def processar_lote(
       - sobreposicoes: pares de código com sobreposição detectada (Módulo 7,
         S3) — lista vazia se `caminho_relatorio` não for informado ou se
         nenhuma sobreposição for encontrada. Não bloqueante (Opção A).
+      - bloqueios_sobreposicao (Bloco B v4, [FAT-203]): pares acima do
+        limiar de bloqueio, sempre avaliados (independente de
+        `caminho_relatorio`) — ver `avaliar_bloqueio_sobreposicao`.
     Propaga o erro da primeira linha inválida (sem gravar arquivo parcial) —
-    R6/R2: falha explícita, nunca resultado parcial silencioso.
+    R6/R2: falha explícita, nunca resultado parcial silencioso. Isso também
+    vale para bloqueio de duplicidade central (Bloco A v4, [FAT-181]): se
+    qualquer linha for recusada, nenhum arquivo é exportado.
 
     `max_tentativas`, `espera_base_s` e `timeout_s` são repassados a
     `processar_linha_lote` (padrões idênticos ao comportamento anterior).  [FAT-119, S7]
@@ -953,39 +991,73 @@ def processar_lote(
     `caminho_historico`: se informado, grava `todos_registros` em um banco
     SQLite persistente entre execuções (`salvar_no_historico`).  Opcional;
     se omitido, nenhuma persistência ocorre.  [FAT-155, S5]
+
+    `pg_dsn` (Bloco A v4, [FAT-181, FAT-182, FAT-183, FAT-202]): se
+    informado, cada linha é checada contra a base central PostgreSQL antes
+    de gerar geometria; `substituir`/`confirmar_substituicao`/
+    `motivo_substituicao` controlam a substituição intencional. Ao final,
+    as cercas geradas são registradas como ativas na base central.
+    `limiar_sobreposicao`/`overrides_sobreposicao` (Bloco B v4, [FAT-203,
+    FAT-185, FAT-186]) controlam o bloqueio de sobreposição geométrica.
     """
     linhas_lote = ler_lote(caminho_entrada)
     if verbose:
         print(f"  ✓ {len(linhas_lote)} cerca(s) no arquivo de lote '{caminho_entrada}'.")
 
-    todas_linhas: List[str] = []
-    todos_registros: List[Dict] = []
-    for row in linhas_lote:
-        linhas_sascar, registros = processar_linha_lote(
-            row, verbose=verbose,
-            max_tentativas=max_tentativas, espera_base_s=espera_base_s, timeout_s=timeout_s,
-            usar_cache=usar_cache, cache_ttl_s=cache_ttl_s,
+    pg_conn = _pg_conectar(pg_dsn) if pg_dsn else None
+    try:
+        if pg_conn is not None:
+            _pg_criar_tabela(pg_conn)
+
+        todas_linhas: List[str] = []
+        todos_registros: List[Dict] = []
+        for row in linhas_lote:
+            linhas_sascar, registros = processar_linha_lote(
+                row, verbose=verbose,
+                max_tentativas=max_tentativas, espera_base_s=espera_base_s, timeout_s=timeout_s,
+                usar_cache=usar_cache, cache_ttl_s=cache_ttl_s,
+                pg_conn=pg_conn, substituir=substituir,
+                confirmar_substituicao=confirmar_substituicao,
+                motivo_substituicao=motivo_substituicao,
+            )
+            todas_linhas.extend(linhas_sascar)
+            todos_registros.extend(registros)
+
+        total = exportar_lote(todas_linhas, caminho_saida, verbose=verbose)
+
+        sobreposicoes: List[Tuple[str, str]] = []
+        if caminho_relatorio:
+            if verbose:
+                print(f"\n[MÓDULO 7] Verificando sobreposição entre polígonos...  [FAT-78, S3]")
+            sobreposicoes = detectar_sobreposicao(todos_registros)
+
+        bloqueios_sobreposicao = avaliar_bloqueio_sobreposicao(
+            todos_registros, limiar_bloqueio=limiar_sobreposicao,
+            overrides=overrides_sobreposicao,
         )
-        todas_linhas.extend(linhas_sascar)
-        todos_registros.extend(registros)
 
-    total = exportar_lote(todas_linhas, caminho_saida, verbose=verbose)
+        if caminho_relatorio:
+            if verbose:
+                print(f"\n[MÓDULO 8] Gerando relatório '{caminho_relatorio}'...  [FAT-78, S5]")
+            gerar_relatorio(todos_registros, caminho_relatorio, sobreposicoes, verbose=verbose,
+                             bloqueios_sobreposicao=bloqueios_sobreposicao)
 
-    sobreposicoes: List[Tuple[str, str]] = []
-    if caminho_relatorio:
-        if verbose:
-            print(f"\n[MÓDULO 7] Verificando sobreposição entre polígonos...  [FAT-78, S3]")
-        sobreposicoes = detectar_sobreposicao(todos_registros)
-        if verbose:
-            print(f"\n[MÓDULO 8] Gerando relatório '{caminho_relatorio}'...  [FAT-78, S5]")
-        gerar_relatorio(todos_registros, caminho_relatorio, sobreposicoes, verbose=verbose)
+        if caminho_historico:
+            if verbose:
+                print(f"\n[MÓDULO 9] Gravando histórico '{caminho_historico}'...  [FAT-155, S5]")
+            salvar_no_historico(todos_registros, caminho_historico, verbose=verbose)
 
-    if caminho_historico:
-        if verbose:
-            print(f"\n[MÓDULO 9] Gravando histórico '{caminho_historico}'...  [FAT-155, S5]")
-        salvar_no_historico(todos_registros, caminho_historico, verbose=verbose)
+        if pg_conn is not None:
+            execucao_id_central = datetime.now().strftime("%Y%m%d%H%M%S")
+            if verbose:
+                print(f"\n[MÓDULO 9] Registrando na base central (Bloco A v4)...  [FAT-181, FAT-183]")
+            for registro in todos_registros:
+                registrar_cerca_central(pg_conn, registro, execucao_id_central)
 
-    return total, todos_registros, sobreposicoes
+        return total, todos_registros, sobreposicoes, bloqueios_sobreposicao
+    finally:
+        if pg_conn is not None:
+            pg_conn.close()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1049,6 +1121,94 @@ def detectar_sobreposicao(registros: List[Dict]) -> List[Tuple[str, str]]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# MÓDULO 7 — BLOCO B v4: BLOQUEIO DE SOBREPOSIÇÃO GEOMÉTRICA
+# [FAT-185, FAT-186, FAT-193, FAT-203, DEC-V4-05, DEC-V4-06]
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Extensão aditiva de `detectar_sobreposicao` (acima, inalterada). Enquanto
+# `detectar_sobreposicao` só detecta interseção booleana para fins de
+# alerta/relatório (Módulo 7 v2/v3, Opção A), as funções abaixo medem o
+# PERCENTUAL de área sobreposta e decidem bloqueio quando esse percentual
+# ultrapassa um limiar. Bloqueio é conservador (FAT-185): só os pares acima
+# do limiar são candidatos a bloqueio; os demais seguem só como alerta,
+# via `detectar_sobreposicao`, comportamento herdado e inalterado.
+#
+# O limiar de 90% (FAT-203) é PROVISÓRIO e sem validação empírica
+# (Lacuna P1, FAT-195) — por isso é parametrizável (`--limiar-sobreposicao`),
+# nunca hard-coded como definitivo. Constante `LIMIAR_SOBREPOSICAO_BLOQUEIO_PADRAO`
+# definida junto às demais constantes de módulo (topo do arquivo).
+
+
+def _percentual_sobreposicao(poly_existente: Polygon, poly_novo: Polygon) -> float:
+    """
+    Percentual da área de `poly_existente` (cerca já gerada anteriormente
+    na mesma execução) coberto pela interseção com `poly_novo` (cerca sendo
+    gerada agora). [FAT-203]
+    """
+    if poly_existente.area == 0:
+        return 0.0
+    try:
+        return poly_existente.intersection(poly_novo).area / poly_existente.area
+    except Exception:
+        return 0.0
+
+
+def avaliar_bloqueio_sobreposicao(
+    registros: List[Dict],
+    limiar_bloqueio: float = LIMIAR_SOBREPOSICAO_BLOQUEIO_PADRAO,
+    overrides: Optional[Dict[Tuple[str, str], Dict]] = None,
+) -> List[Dict]:
+    """
+    Avalia, para cada par de cercas com SEQ diferente (mesma exclusão de
+    PRI/PRE do mesmo conjunto usada por `detectar_sobreposicao`), o
+    percentual de área do polígono mais antigo (`i`, ordem de aparição em
+    `registros`) coberto pelo mais novo (`j`). [FAT-203]
+
+    Retorna só os pares cujo percentual ultrapassa `limiar_bloqueio` — os
+    demais permanecem cobertos apenas pelo alerta de `detectar_sobreposicao`
+    (comportamento herdado, FAT-185). Cada item retornado é um dict:
+        {codigo_existente, codigo_novo, percentual, bloqueado, override}
+    `bloqueado` é False quando há um override manual para o par em
+    `overrides` (chave `(codigo_existente, codigo_novo)`, valor
+    `{"justificativa", "confirmado_por", "quando"}`) — mecanismo de override
+    com justificativa obrigatória. [FAT-186]
+    """
+    overrides = overrides or {}
+    resultado: List[Dict] = []
+    candidatos = [
+        (r, _construir_poligono(r.get("vertices", [])))
+        for r in registros if r.get("vertices")
+    ]
+
+    for i in range(len(candidatos)):
+        r1, p1 = candidatos[i]
+        if p1 is None:
+            continue
+        for j in range(i + 1, len(candidatos)):
+            r2, p2 = candidatos[j]
+            if p2 is None:
+                continue
+            if r1.get("seq") == r2.get("seq"):
+                continue  # PRI/PRE do mesmo conjunto — não é anomalia [FAT-39]
+
+            percentual = _percentual_sobreposicao(p1, p2)
+            if percentual <= limiar_bloqueio:
+                continue
+
+            par = (r1["codigo"], r2["codigo"])
+            override = overrides.get(par)
+            resultado.append({
+                "codigo_existente": par[0],
+                "codigo_novo": par[1],
+                "percentual": percentual,
+                "bloqueado": override is None,
+                "override": override,
+            })
+
+    return resultado
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # MÓDULO 8 — RELATÓRIO DE CERCAS GERADAS  [FAT-78, S5]
 # ─────────────────────────────────────────────────────────────────────────────
 #
@@ -1061,6 +1221,7 @@ def gerar_relatorio(
     caminho: str,
     sobreposicoes: Optional[List[Tuple[str, str]]] = None,
     verbose: bool = True,
+    bloqueios_sobreposicao: Optional[List[Dict]] = None,
 ) -> int:
     """
     Grava um relatório CSV com o resumo das cercas geradas nesta execução.
@@ -1069,6 +1230,11 @@ def gerar_relatorio(
     Colunas: codigo, tipo, extensao_m, vertice_inicial, vertice_final,
     num_vertices. Se houver sobreposições (Módulo 7), acrescenta uma seção
     de alertas ao final — apenas informativa, não bloqueante (Opção A).
+
+    `bloqueios_sobreposicao` (Bloco B v4, FAT-186): se informado, acrescenta
+    uma seção com os pares avaliados acima do limiar de bloqueio, incluindo
+    override manual (justificativa, quem confirmou, quando) quando existir —
+    preserva a rastreabilidade exigida para o override. [FAT-186]
 
     Retorna o número de cercas (linhas) registradas no relatório.
     """
@@ -1097,10 +1263,30 @@ def gerar_relatorio(
             for a, b in sobreposicoes:
                 writer.writerow([a, "sobrepoe", b])
 
+        if bloqueios_sobreposicao:
+            writer.writerow([])
+            writer.writerow(["BLOQUEIO DE SOBREPOSICAO (Bloco B v4) - FAT-203/FAT-186"])
+            writer.writerow([
+                "codigo_existente", "codigo_novo", "percentual", "bloqueado",
+                "justificativa", "confirmado_por", "quando",
+            ])
+            for b in bloqueios_sobreposicao:
+                override = b.get("override") or {}
+                writer.writerow([
+                    b["codigo_existente"], b["codigo_novo"],
+                    f"{b['percentual']*100:.1f}%", b["bloqueado"],
+                    override.get("justificativa", ""),
+                    override.get("confirmado_por", ""),
+                    override.get("quando", ""),
+                ])
+
     if verbose:
         msg = f"  ✓ Relatório gravado em '{caminho}' ({n} cerca(s))."
         if sobreposicoes:
             msg += f"  ⚠ {len(sobreposicoes)} sobreposição(ões) detectada(s) — ver relatório."
+        if bloqueios_sobreposicao:
+            n_bloqueados = sum(1 for b in bloqueios_sobreposicao if b["bloqueado"])
+            msg += f"  ⛔ {n_bloqueados} bloqueio(s) de sobreposição (Bloco B v4) — ver relatório."
         print(msg)
 
     return n
@@ -1234,6 +1420,192 @@ def consultar_historico(caminho_db: str, filtros: Optional[Dict[str, str]] = Non
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# MÓDULO 9 — BLOCO A v4: DUPLICIDADE DE CÓDIGO CONTRA BASE CENTRAL (POSTGRESQL)
+# [FAT-181, FAT-182, FAT-183, FAT-202, DEC-V4-01, DEC-V4-02, DEC-V4-03]
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Camada aditiva e opcional (--pg-dsn), independente do histórico local em
+# SQLite acima (--historico, mantido inalterado). Enquanto o histórico local
+# só alerta, esta camada BLOQUEIA a geração quando o CÓDIGO (combinação
+# rodovia/cidade/UF/velocidade/SEQ) já existir ativo na base central —
+# checagem centralizada, não mais por instalação (FAT-183). A conexão real
+# ao driver psycopg2 é feita de forma preguiçosa (import dentro da função),
+# então o restante do sistema/suíte de testes funciona normalmente mesmo sem
+# a dependência instalada.
+
+_SEQ_MAX = 999
+
+
+class DuplicidadeCodigoCentralError(Exception):
+    """Bloqueio de duplicidade de CÓDIGO na base central. [FAT-181, FAT-182]"""
+
+
+def _pg_conectar(dsn: str):
+    """
+    Abre uma conexão com a base central PostgreSQL. [FAT-202]
+    Import de `psycopg2` é preguiçoso — só é exigido quando esta função é
+    de fato chamada (--pg-dsn informado).
+    """
+    import psycopg2
+    try:
+        return psycopg2.connect(dsn)
+    except Exception as e:
+        raise RuntimeError(f"Falha ao conectar à base central PostgreSQL (--pg-dsn): {e}") from e
+
+
+def _pg_criar_tabela(conn) -> None:
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS cercas_central (
+            id               SERIAL PRIMARY KEY,
+            codigo           TEXT NOT NULL,
+            tipo             TEXT NOT NULL,
+            rodovia          TEXT NOT NULL,
+            cidade           TEXT NOT NULL,
+            uf               TEXT NOT NULL,
+            velocidade       INTEGER NOT NULL,
+            seq              INTEGER NOT NULL,
+            extensao_m       REAL,
+            vertice_inicial  TEXT,
+            vertice_final    TEXT,
+            num_vertices     INTEGER,
+            data_criacao     TEXT,
+            execucao_id      TEXT,
+            status           TEXT NOT NULL DEFAULT 'ativo',
+            superado_em      TEXT,
+            superado_motivo  TEXT
+        )
+    """)
+    conn.commit()
+
+
+def verificar_codigo_central(
+    conn, rodovia: str, cidade: str, uf: str, velocidade: int, seq: int
+) -> Optional[Dict]:
+    """
+    Busca um registro ATIVO na base central para a combinação
+    rodovia/cidade/UF/velocidade/SEQ (SEQ é comum a PRI e PRE do mesmo
+    conjunto, por isso a checagem ignora `tipo`). [FAT-181, FAT-183]
+
+    Retorna o registro (dict) se existir, senão `None`.
+    """
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT codigo, tipo, rodovia, cidade, uf, velocidade, seq, execucao_id "
+        "FROM cercas_central WHERE rodovia = %s AND cidade = %s AND uf = %s "
+        "AND velocidade = %s AND seq = %s AND status = 'ativo' LIMIT 1",
+        (rodovia, cidade, uf, velocidade, seq),
+    )
+    row = cursor.fetchone()
+    if row is None:
+        return None
+    colunas = ("codigo", "tipo", "rodovia", "cidade", "uf", "velocidade", "seq", "execucao_id")
+    return dict(zip(colunas, row))
+
+
+def sugerir_proximo_seq_livre(conn, rodovia: str, cidade: str, uf: str, velocidade: int) -> int:
+    """
+    Sugere o próximo SEQ livre (1–999) para a combinação
+    rodovia/cidade/UF/velocidade — o MENOR inteiro ainda não usado por
+    nenhum registro (ativo ou superado) dessa combinação, preenchendo
+    eventuais lacunas. [FAT-181, Seção 5.2 — UX livre]
+    """
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT seq FROM cercas_central WHERE rodovia = %s AND cidade = %s AND uf = %s "
+        "AND velocidade = %s",
+        (rodovia, cidade, uf, velocidade),
+    )
+    usados = {row[0] for row in cursor.fetchall()}
+    for candidato in range(1, _SEQ_MAX + 1):
+        if candidato not in usados:
+            return candidato
+    raise DuplicidadeCodigoCentralError(
+        f"Nenhum SEQ livre entre 1 e {_SEQ_MAX} para {rodovia}/{cidade}_{uf.upper()}/"
+        f"{velocidade} KmH."
+    )
+
+
+def substituir_cerca_central(
+    conn, rodovia: str, cidade: str, uf: str, velocidade: int, seq: int,
+    motivo: Optional[str] = None,
+) -> int:
+    """
+    Marca o(s) registro(s) ATIVO(s) da combinação rodovia/cidade/UF/
+    velocidade/SEQ como 'superado' — nunca apaga (princípio C2). [FAT-182]
+
+    Retorna o número de registros marcados como superados.
+    """
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE cercas_central SET status = 'superado', superado_em = %s, "
+        "superado_motivo = %s WHERE rodovia = %s AND cidade = %s AND uf = %s "
+        "AND velocidade = %s AND seq = %s AND status = 'ativo'",
+        (datetime.now().isoformat(timespec="seconds"), motivo,
+         rodovia, cidade, uf, velocidade, seq),
+    )
+    n = cursor.rowcount
+    conn.commit()
+    return n
+
+
+def registrar_cerca_central(conn, registro: Dict, execucao_id: str) -> None:
+    """
+    Insere `registro` (mesmo formato usado por `salvar_no_historico`) como
+    ATIVO na base central. [FAT-181, FAT-183]
+    """
+    vertices = registro.get("vertices", [])
+    v_ini = f"{vertices[0][0]:.6f},{vertices[0][1]:.6f}" if vertices else ""
+    v_fim = f"{vertices[-1][0]:.6f},{vertices[-1][1]:.6f}" if vertices else ""
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO cercas_central (codigo, tipo, rodovia, cidade, uf, velocidade, "
+        "seq, extensao_m, vertice_inicial, vertice_final, num_vertices, data_criacao, "
+        "execucao_id, status) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'ativo')",
+        (
+            registro.get("codigo", ""), registro.get("tipo", ""),
+            registro.get("rodovia", ""), registro.get("cidade", ""), registro.get("uf", ""),
+            registro.get("velocidade"), registro.get("seq"), registro.get("extensao_m", 0),
+            v_ini, v_fim, len(vertices),
+            datetime.now().isoformat(timespec="seconds"), execucao_id,
+        ),
+    )
+    conn.commit()
+
+
+def _checar_duplicidade_central(
+    conn, rodovia: str, cidade: str, uf: str, velocidade: int, seq: int,
+    substituir: bool = False, confirmar_substituicao: bool = False,
+    motivo_substituicao: Optional[str] = None,
+    identificador: Optional[str] = None,
+) -> None:
+    """
+    Recusa a geração (`DuplicidadeCodigoCentralError`) se já existir CÓDIGO
+    ativo na base central para a combinação, a menos que a substituição
+    intencional tenha sido declarada E confirmada (`--substituir` +
+    `--confirmar-substituicao` — mecanismo de "flag + confirmação",
+    [FAT-182]). Nesse caso, marca o registro antigo como superado e permite
+    a execução prosseguir. [FAT-181, FAT-182]
+    """
+    existente = verificar_codigo_central(conn, rodovia, cidade, uf, velocidade, seq)
+    if existente is None:
+        return
+
+    if not (substituir and confirmar_substituicao):
+        sugestao = sugerir_proximo_seq_livre(conn, rodovia, cidade, uf, velocidade)
+        alvo = f" ({identificador})" if identificador else ""
+        raise DuplicidadeCodigoCentralError(
+            f"CÓDIGO já ativo na base central{alvo} para "
+            f"{rodovia}/{cidade}_{uf.upper()}/{velocidade} KmH / SEQ {seq:03d}. "
+            f"Próximo SEQ livre sugerido: {sugestao:03d}. Para reemitir "
+            f"intencionalmente sob este SEQ, use --substituir junto com "
+            f"--confirmar-substituicao. [FAT-181, FAT-182]"
+        )
+
+    substituir_cerca_central(conn, rodovia, cidade, uf, velocidade, seq, motivo=motivo_substituicao)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # CLI — ORQUESTRAÇÃO DOS 6 MÓDULOS
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1339,8 +1711,62 @@ def main():
                              "registradas entre execuções distintas. Opcional; se omitido, "
                              "nenhuma persistência ocorre. [S5]")
 
+    # Bloco A v4 — duplicidade de CÓDIGO contra base central PostgreSQL
+    # [FAT-181, FAT-182, FAT-183, FAT-202]
+    parser.add_argument("--pg-dsn", default=None,
+                        help="String de conexão (DSN libpq) da base central PostgreSQL "
+                             "usada para bloquear duplicidade de CÓDIGO. Opcional; se "
+                             "omitido, esta checagem central fica desligada (o histórico "
+                             "local em --historico continua funcionando normalmente, "
+                             "sem bloquear). [FAT-183, FAT-202, Bloco A v4]")
+    parser.add_argument("--substituir", action="store_true",
+                        help="Declara intenção de reemitir uma cerca sob o mesmo CÓDIGO/SEQ "
+                             "já ativo na base central. Requer --confirmar-substituicao. "
+                             "O registro antigo é marcado como superado, nunca apagado. "
+                             "[FAT-182, Bloco A v4]")
+    parser.add_argument("--confirmar-substituicao", action="store_true",
+                        help="Confirma a substituição intencional declarada em --substituir "
+                             "(mecanismo de flag + confirmação). [FAT-182, Bloco A v4]")
+    parser.add_argument("--motivo-substituicao", default=None,
+                        help="Texto livre opcional registrado junto com a substituição "
+                             "(auditoria). [Bloco A v4]")
+
+    # Bloco B v4 — bloqueio de sobreposição geométrica acima do limiar
+    # [FAT-185, FAT-186, FAT-203]
+    parser.add_argument("--limiar-sobreposicao", type=float,
+                        default=LIMIAR_SOBREPOSICAO_BLOQUEIO_PADRAO,
+                        help="Percentual (0–1) de área de um polígono pré-existente coberta "
+                             "por um novo a partir do qual a sobreposição é bloqueada, em "
+                             "vez de apenas alertada. Padrão: "
+                             f"{LIMIAR_SOBREPOSICAO_BLOQUEIO_PADRAO} — PROVISÓRIO, sem "
+                             "validação empírica (FAT-195). Só se aplica no modo --batch. "
+                             "[FAT-203, Bloco B v4]")
+    parser.add_argument("--override-sobreposicao", action="append", default=None,
+                        metavar="CODIGO_EXISTENTE:CODIGO_NOVO:JUSTIFICATIVA",
+                        help="Registra um override manual para um par de CÓDIGOs bloqueado "
+                             "por sobreposição (ex.: vias paralelas classificadas "
+                             "incorretamente). Justificativa é obrigatória. Repetível para "
+                             "mais de um par. 'Quem confirmou' é o usuário do sistema "
+                             "operacional atual. [FAT-186, Bloco B v4]")
+
     args    = parser.parse_args()
     verbose = not args.silencioso
+
+    overrides_sobreposicao: Dict[Tuple[str, str], Dict] = {}
+    for item in (args.override_sobreposicao or []):
+        partes = item.split(":", 2)
+        if len(partes) != 3 or not partes[2].strip():
+            parser.error(
+                "--override-sobreposicao deve ter o formato "
+                "'CODIGO_EXISTENTE:CODIGO_NOVO:justificativa', com justificativa "
+                "não vazia. [FAT-186]"
+            )
+        codigo_existente, codigo_novo, justificativa = partes
+        overrides_sobreposicao[(codigo_existente, codigo_novo)] = {
+            "justificativa": justificativa.strip(),
+            "confirmado_por": getpass.getuser(),
+            "quando": datetime.now().isoformat(timespec="seconds"),
+        }
 
     # ── Bifurcação: modo --batch vs. modo single-cerca (v1.4 inalterado) ──────
     if args.batch:
@@ -1355,7 +1781,7 @@ def main():
         if verbose:
             print(f"\n[MÓDULO 1B] Lendo arquivo de lote '{args.batch}'...  [FAT-63]")
         try:
-            n, _registros, _sobreposicoes = processar_lote(
+            n, _registros, _sobreposicoes, bloqueios_sobreposicao = processar_lote(
                 args.batch, caminho_saida, verbose=verbose,
                 caminho_relatorio=args.relatorio,
                 max_tentativas=args.retry_tentativas,
@@ -1364,7 +1790,16 @@ def main():
                 usar_cache=args.cache,
                 cache_ttl_s=args.cache_ttl,
                 caminho_historico=args.historico,
+                pg_dsn=args.pg_dsn,
+                substituir=args.substituir,
+                confirmar_substituicao=args.confirmar_substituicao,
+                motivo_substituicao=args.motivo_substituicao,
+                limiar_sobreposicao=args.limiar_sobreposicao,
+                overrides_sobreposicao=overrides_sobreposicao,
             )
+        except DuplicidadeCodigoCentralError as e:
+            print(f"\nBLOQUEIO (Bloco A v4 — duplicidade de CÓDIGO): {e}", file=sys.stderr)
+            sys.exit(3)
         except (ValueError, RuntimeError) as e:
             print(f"\nERRO no processamento do lote: {e}", file=sys.stderr)
             sys.exit(1)
@@ -1374,6 +1809,18 @@ def main():
         erros = validar_csv(caminho_saida, verbose)
         if erros:
             sys.exit(2)
+
+        bloqueios_ativos = [b for b in bloqueios_sobreposicao if b["bloqueado"]]
+        if bloqueios_ativos:
+            print(f"\nBLOQUEIO (Bloco B v4 — sobreposição geométrica): "
+                  f"{len(bloqueios_ativos)} par(es) acima do limiar de "
+                  f"{args.limiar_sobreposicao*100:.0f}% sem override.", file=sys.stderr)
+            for b in bloqueios_ativos:
+                print(f"  - {b['codigo_existente']} x {b['codigo_novo']}: "
+                      f"{b['percentual']*100:.1f}% sobreposto. Use "
+                      f"--override-sobreposicao '{b['codigo_existente']}:{b['codigo_novo']}:"
+                      f"<justificativa>' para resolver. [FAT-186]", file=sys.stderr)
+            sys.exit(4)
 
         if verbose:
             print(f"\n{'='*60}")
@@ -1428,6 +1875,29 @@ def main():
               f"Buffer: {args.buffer} m/lado ({args.buffer*2:.0f} m total)")
         print(f"  ✓ CÓDIGO base: {args.rodovia} / {args.cidade}/{args.uf.upper()} / "
               f"{args.velocidade} KmH / SEQ {args.seq:03d}  [FAT-32, FAT-35]")
+
+    # ── Bloco A v4: duplicidade de CÓDIGO contra base central ────────────────
+    # [FAT-181, FAT-182, FAT-183, FAT-202] — checada antes do Módulo 2 (falha
+    # rápida, sem custo de consulta OSM) quando --pg-dsn é informado.
+    if args.pg_dsn:
+        try:
+            pg_conn = _pg_conectar(args.pg_dsn)
+        except RuntimeError as e:
+            print(f"\nERRO: {e}", file=sys.stderr)
+            sys.exit(1)
+        try:
+            _pg_criar_tabela(pg_conn)
+            _checar_duplicidade_central(
+                pg_conn, args.rodovia, args.cidade, args.uf, args.velocidade, args.seq,
+                substituir=args.substituir,
+                confirmar_substituicao=args.confirmar_substituicao,
+                motivo_substituicao=args.motivo_substituicao,
+            )
+        except DuplicidadeCodigoCentralError as e:
+            print(f"\nBLOQUEIO (Bloco A v4 — duplicidade de CÓDIGO): {e}", file=sys.stderr)
+            sys.exit(3)
+        finally:
+            pg_conn.close()
 
     # ── Módulo 2: Geometria ────────────────────────────────────────────────────
     if verbose:
@@ -1506,7 +1976,7 @@ def main():
     if erros:
         sys.exit(2)
 
-    if args.relatorio or args.historico:
+    if args.relatorio or args.historico or args.pg_dsn:
         registros_relatorio: List[Dict] = []
         for chave, dados in cercas.items():
             verts = dados.get("vertices", [])
@@ -1532,6 +2002,18 @@ def main():
             if verbose:
                 print(f"\n[MÓDULO 9] Gravando histórico '{args.historico}'...  [FAT-155, S5]")
             salvar_no_historico(registros_relatorio, args.historico, verbose=verbose)
+
+        if args.pg_dsn:
+            if verbose:
+                print(f"\n[MÓDULO 9] Registrando na base central (Bloco A v4)...  "
+                      f"[FAT-181, FAT-183]")
+            pg_conn = _pg_conectar(args.pg_dsn)
+            execucao_id_central = datetime.now().strftime("%Y%m%d%H%M%S")
+            try:
+                for registro in registros_relatorio:
+                    registrar_cerca_central(pg_conn, registro, execucao_id_central)
+            finally:
+                pg_conn.close()
 
     if verbose:
         print(f"\n{'='*60}")

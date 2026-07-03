@@ -12,15 +12,19 @@ import requests
 import cercas_v2
 from cercas_v2 import (
     _COSTURA_DIST_MAX_M,
+    LIMIAR_SOBREPOSICAO_BLOQUEIO_PADRAO,
+    DuplicidadeCodigoCentralError,
     _cache_get,
     _cache_key,
     _cache_set,
+    _checar_duplicidade_central,
     _costura_ways,
     _haversine_m,
     _montar_codigo,
     _overpass_query,
     _utm_epsg,
     _validar_rodovia,
+    avaliar_bloqueio_sobreposicao,
     buscar_geometria_osm,
     consultar_historico,
     detectar_sobreposicao,
@@ -30,8 +34,12 @@ from cercas_v2 import (
     ler_lote,
     parse_coord,
     parse_polilinha_manual,
+    registrar_cerca_central,
     salvar_no_historico,
+    substituir_cerca_central,
+    sugerir_proximo_seq_livre,
     validar_csv,
+    verificar_codigo_central,
 )
 
 # Polilinha manual: trecho reto N-S próximo a Curitiba (~5,5 km)
@@ -584,3 +592,249 @@ def test_consultar_historico_filtra_por_rodovia_uf_codigo(tmp_path):
 
 def test_consultar_historico_sem_arquivo_retorna_lista_vazia(tmp_path):
     assert consultar_historico(str(tmp_path / "nao_existe.db")) == []
+
+
+# ── Bloco B v4: bloqueio de sobreposição geométrica [FAT-185/186/203] ────────
+
+def test_avaliar_bloqueio_sobreposicao_acima_limiar_bloqueia():
+    registros = [
+        {"codigo": "A1", "seq": 1, "vertices": [(0, 0), (0, 1), (1, 1), (1, 0)]},
+        {"codigo": "A2", "seq": 2, "vertices": [(-0.05, -0.05), (-0.05, 1.05), (1.05, 1.05), (1.05, -0.05)]},
+    ]
+    bloqueios = avaliar_bloqueio_sobreposicao(registros)
+    assert len(bloqueios) == 1
+    b = bloqueios[0]
+    assert b["codigo_existente"] == "A1"
+    assert b["codigo_novo"] == "A2"
+    assert b["percentual"] == pytest.approx(1.0)
+    assert b["bloqueado"] is True
+    assert b["override"] is None
+
+def test_avaliar_bloqueio_sobreposicao_abaixo_limiar_nao_retorna():
+    registros = [
+        {"codigo": "A1", "seq": 1, "vertices": [(0, 0), (0, 1), (1, 1), (1, 0)]},
+        {"codigo": "A2", "seq": 2, "vertices": [(0.5, 0.5), (0.5, 1.5), (1.5, 1.5), (1.5, 0.5)]},
+    ]
+    assert avaliar_bloqueio_sobreposicao(registros) == []
+
+def test_avaliar_bloqueio_sobreposicao_limiar_customizado():
+    # Mesmo par do teste acima (25% de sobreposição) — não bloqueia com o
+    # limiar padrão (90%), mas bloqueia com um limiar customizado mais baixo,
+    # confirmando que o valor provisório de 90% é parametrizável. [FAT-203, FAT-195]
+    registros = [
+        {"codigo": "A1", "seq": 1, "vertices": [(0, 0), (0, 1), (1, 1), (1, 0)]},
+        {"codigo": "A2", "seq": 2, "vertices": [(0.5, 0.5), (0.5, 1.5), (1.5, 1.5), (1.5, 0.5)]},
+    ]
+    bloqueios = avaliar_bloqueio_sobreposicao(registros, limiar_bloqueio=0.2)
+    assert len(bloqueios) == 1
+    assert bloqueios[0]["percentual"] == pytest.approx(0.25)
+
+def test_avaliar_bloqueio_sobreposicao_ignora_mesmo_seq():
+    # PRI/PRE do mesmo conjunto sempre se sobrepõem — não é anomalia,
+    # mesma exclusão usada em detectar_sobreposicao. [FAT-39]
+    registros = [
+        {"codigo": "PRI-1", "seq": 1, "vertices": [(0, 0), (0, 1), (1, 1), (1, 0)]},
+        {"codigo": "PRE-1", "seq": 1, "vertices": [(0, 0), (0, 1), (1, 1), (1, 0)]},
+    ]
+    assert avaliar_bloqueio_sobreposicao(registros) == []
+
+def test_avaliar_bloqueio_sobreposicao_override_desbloqueia():
+    registros = [
+        {"codigo": "A1", "seq": 1, "vertices": [(0, 0), (0, 1), (1, 1), (1, 0)]},
+        {"codigo": "A2", "seq": 2, "vertices": [(-0.05, -0.05), (-0.05, 1.05), (1.05, 1.05), (1.05, -0.05)]},
+    ]
+    overrides = {
+        ("A1", "A2"): {
+            "justificativa": "vias paralelas classificadas incorretamente",
+            "confirmado_por": "caueh.rebello", "quando": "2026-07-03T10:00:00",
+        },
+    }
+    bloqueios = avaliar_bloqueio_sobreposicao(registros, overrides=overrides)
+    assert len(bloqueios) == 1
+    assert bloqueios[0]["bloqueado"] is False
+    assert bloqueios[0]["override"]["justificativa"] == "vias paralelas classificadas incorretamente"
+
+def test_gerar_relatorio_com_bloqueios_sobreposicao():
+    registros = [
+        {"codigo": "A1", "tipo": "PRI", "vertices": [(-25.0, -49.0), (-25.1, -49.1)], "extensao_m": 500},
+    ]
+    bloqueios = [{
+        "codigo_existente": "A1", "codigo_novo": "A2", "percentual": 0.95,
+        "bloqueado": True, "override": None,
+    }]
+    with tempfile.NamedTemporaryFile(suffix=".csv", delete=False, mode="w") as f:
+        caminho = f.name
+    try:
+        gerar_relatorio(registros, caminho, bloqueios_sobreposicao=bloqueios, verbose=False)
+        with open(caminho, encoding="utf-8") as f:
+            conteudo = f.read()
+        assert "BLOQUEIO DE SOBREPOSICAO" in conteudo
+        assert "A1" in conteudo and "A2" in conteudo
+    finally:
+        os.unlink(caminho)
+
+
+# ── Bloco A v4: duplicidade de CÓDIGO contra base central [FAT-181/182/183] ──
+#
+# `psycopg2` real não é usado nestes testes: as funções recebem uma conexão
+# já aberta como parâmetro, então usamos uma conexão/cursor "fake" em
+# memória que imita apenas o subconjunto da API usado pelo código (cursor(),
+# execute(sql, params), fetchone(), fetchall(), rowcount, commit(), close()).
+# Isso cobre a lógica de negócio (checagem, sugestão de SEQ, substituição),
+# mas NÃO valida a conexão real com um servidor PostgreSQL — não há
+# servidor disponível neste ambiente.
+
+class _FakeCentralCursor:
+    def __init__(self, conn):
+        self._conn = conn
+        self._resultado = []
+        self.rowcount = 0
+
+    def execute(self, sql, params=()):
+        s = sql.strip()
+        if s.startswith("CREATE TABLE"):
+            return
+        if s.startswith("SELECT codigo"):
+            rodovia, cidade, uf, velocidade, seq = params
+            self._resultado = [
+                (r["codigo"], r["tipo"], r["rodovia"], r["cidade"], r["uf"],
+                 r["velocidade"], r["seq"], r["execucao_id"])
+                for r in self._conn.rows
+                if r["rodovia"] == rodovia and r["cidade"] == cidade and r["uf"] == uf
+                and r["velocidade"] == velocidade and r["seq"] == seq and r["status"] == "ativo"
+            ]
+            return
+        if s.startswith("SELECT seq"):
+            rodovia, cidade, uf, velocidade = params
+            self._resultado = [
+                (r["seq"],) for r in self._conn.rows
+                if r["rodovia"] == rodovia and r["cidade"] == cidade and r["uf"] == uf
+                and r["velocidade"] == velocidade
+            ]
+            return
+        if s.startswith("UPDATE"):
+            timestamp, motivo, rodovia, cidade, uf, velocidade, seq = params
+            n = 0
+            for r in self._conn.rows:
+                if (r["rodovia"] == rodovia and r["cidade"] == cidade and r["uf"] == uf
+                        and r["velocidade"] == velocidade and r["seq"] == seq
+                        and r["status"] == "ativo"):
+                    r["status"] = "superado"
+                    r["superado_em"] = timestamp
+                    r["superado_motivo"] = motivo
+                    n += 1
+            self.rowcount = n
+            return
+        if s.startswith("INSERT"):
+            (codigo, tipo, rodovia, cidade, uf, velocidade, seq, extensao_m,
+             v_ini, v_fim, num_vertices, data_criacao, execucao_id) = params
+            self._conn.rows.append({
+                "codigo": codigo, "tipo": tipo, "rodovia": rodovia, "cidade": cidade,
+                "uf": uf, "velocidade": velocidade, "seq": seq, "extensao_m": extensao_m,
+                "vertice_inicial": v_ini, "vertice_final": v_fim, "num_vertices": num_vertices,
+                "data_criacao": data_criacao, "execucao_id": execucao_id,
+                "status": "ativo", "superado_em": None, "superado_motivo": None,
+            })
+            return
+        raise AssertionError(f"SQL não esperado no fake de teste: {sql}")
+
+    def fetchone(self):
+        return self._resultado[0] if self._resultado else None
+
+    def fetchall(self):
+        return self._resultado
+
+
+class _FakeCentralConn:
+    def __init__(self):
+        self.rows = []
+        self.commits = 0
+
+    def cursor(self):
+        return _FakeCentralCursor(self)
+
+    def commit(self):
+        self.commits += 1
+
+    def close(self):
+        pass
+
+
+def _registro_central(seq=1, codigo=None):
+    codigo = codigo or f"PRI - BR-116 - LUZ_MG - 60 KmH - {seq:03d}"
+    return {
+        "codigo": codigo, "tipo": "PRI", "seq": seq,
+        "vertices": [(-25.0, -49.0), (-25.1, -49.1)], "extensao_m": 1000,
+        "rodovia": "BR-116", "cidade": "LUZ", "uf": "MG", "velocidade": 60,
+    }
+
+def test_registrar_cerca_central_insere_ativo():
+    conn = _FakeCentralConn()
+    registrar_cerca_central(conn, _registro_central(), execucao_id="20260703100000")
+    assert len(conn.rows) == 1
+    assert conn.rows[0]["status"] == "ativo"
+    assert conn.rows[0]["execucao_id"] == "20260703100000"
+
+def test_verificar_codigo_central_encontra_ativo():
+    conn = _FakeCentralConn()
+    registrar_cerca_central(conn, _registro_central(seq=1), execucao_id="x")
+    existente = verificar_codigo_central(conn, "BR-116", "LUZ", "MG", 60, 1)
+    assert existente is not None
+    assert existente["codigo"] == "PRI - BR-116 - LUZ_MG - 60 KmH - 001"
+
+def test_verificar_codigo_central_none_quando_nao_existe():
+    conn = _FakeCentralConn()
+    assert verificar_codigo_central(conn, "BR-116", "LUZ", "MG", 60, 1) is None
+
+def test_sugerir_proximo_seq_livre_sem_uso_retorna_1():
+    conn = _FakeCentralConn()
+    assert sugerir_proximo_seq_livre(conn, "BR-116", "LUZ", "MG", 60) == 1
+
+def test_sugerir_proximo_seq_livre_preenche_lacuna():
+    conn = _FakeCentralConn()
+    for seq in (1, 2, 4):
+        registrar_cerca_central(conn, _registro_central(seq=seq), execucao_id="x")
+    assert sugerir_proximo_seq_livre(conn, "BR-116", "LUZ", "MG", 60) == 3
+
+def test_substituir_cerca_central_marca_superado_nao_apaga():
+    conn = _FakeCentralConn()
+    registrar_cerca_central(conn, _registro_central(seq=1), execucao_id="x")
+    n = substituir_cerca_central(conn, "BR-116", "LUZ", "MG", 60, 1, motivo="reemissao")
+    assert n == 1
+    assert len(conn.rows) == 1  # nunca apaga — só marca como superado [FAT-182]
+    assert conn.rows[0]["status"] == "superado"
+    assert conn.rows[0]["superado_motivo"] == "reemissao"
+    assert verificar_codigo_central(conn, "BR-116", "LUZ", "MG", 60, 1) is None
+
+def test_checar_duplicidade_central_bloqueia_sem_substituir():
+    conn = _FakeCentralConn()
+    registrar_cerca_central(conn, _registro_central(seq=1), execucao_id="x")
+    with pytest.raises(DuplicidadeCodigoCentralError) as exc:
+        _checar_duplicidade_central(conn, "BR-116", "LUZ", "MG", 60, 1)
+    assert "SEQ livre sugerido: 002" in str(exc.value)
+
+def test_checar_duplicidade_central_recusa_substituir_sem_confirmar():
+    # Flag + confirmação: só --substituir não é suficiente. [FAT-182]
+    conn = _FakeCentralConn()
+    registrar_cerca_central(conn, _registro_central(seq=1), execucao_id="x")
+    with pytest.raises(DuplicidadeCodigoCentralError):
+        _checar_duplicidade_central(
+            conn, "BR-116", "LUZ", "MG", 60, 1,
+            substituir=True, confirmar_substituicao=False,
+        )
+    assert verificar_codigo_central(conn, "BR-116", "LUZ", "MG", 60, 1) is not None
+
+def test_checar_duplicidade_central_permite_com_substituir_e_confirmar():
+    conn = _FakeCentralConn()
+    registrar_cerca_central(conn, _registro_central(seq=1), execucao_id="x")
+    _checar_duplicidade_central(
+        conn, "BR-116", "LUZ", "MG", 60, 1,
+        substituir=True, confirmar_substituicao=True, motivo_substituicao="reemissao",
+    )
+    assert conn.rows[0]["status"] == "superado"
+    assert verificar_codigo_central(conn, "BR-116", "LUZ", "MG", 60, 1) is None
+
+def test_checar_duplicidade_central_sem_duplicata_nao_faz_nada():
+    conn = _FakeCentralConn()
+    _checar_duplicidade_central(conn, "BR-116", "LUZ", "MG", 60, 1)
+    assert conn.rows == []

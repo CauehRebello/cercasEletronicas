@@ -133,6 +133,55 @@ Se um CÓDIGO já existir no histórico (de uma execução anterior), é emitido
 um alerta não bloqueante — a execução **não** é interrompida. Consultas
 programáticas por rodovia, UF ou código: `cercas_v2.consultar_historico(caminho_db, filtros)`.
 
+## Bloco A v4 — duplicidade de CÓDIGO contra base central (PostgreSQL)
+
+Independente do histórico local acima. Quando `--pg-dsn` é informado, o
+CÓDIGO (combinação rodovia/cidade/UF/velocidade/SEQ) é checado contra uma
+base central PostgreSQL — se já existir ativo, a execução é **recusada**
+(não apenas alertada), com sugestão automática do próximo SEQ livre.
+
+| Flag | Descrição | Padrão |
+|---|---|---|
+| `--pg-dsn <dsn>` | String de conexão (formato libpq) da base central | nenhuma checagem central |
+| `--substituir` | Declara intenção de reemitir sob o mesmo CÓDIGO/SEQ | desabilitado |
+| `--confirmar-substituicao` | Confirma a substituição declarada em `--substituir` | desabilitado |
+| `--motivo-substituicao <texto>` | Motivo opcional registrado com a substituição | nenhum |
+
+```bash
+python cercas_v2.py --batch lote_modelo.csv --saida saida_lote.csv \
+  --pg-dsn "host=meuservidor dbname=cercas user=cercas_app password=***"
+```
+
+Para reemitir intencionalmente sob o mesmo CÓDIGO (ex.: correção de uma
+cerca já publicada), use `--substituir` **junto com** `--confirmar-substituicao`
+— o registro antigo é marcado como `superado` na base central, nunca
+apagado. Requer a dependência `psycopg2-binary` (em `requirements.txt`),
+carregada apenas quando `--pg-dsn` é usado.
+
+## Bloco B v4 — bloqueio de sobreposição geométrica
+
+Extensão do Módulo 7 (`--relatorio`/sobreposição), aplicável ao modo
+`--batch`: quando o novo polígono cobre mais de um limiar de área de um
+polígono já gerado na mesma execução, a execução é bloqueada em vez de só
+alertada. O limiar padrão (90%) é **provisório**, sem validação empírica —
+por isso é ajustável.
+
+| Flag | Descrição | Padrão |
+|---|---|---|
+| `--limiar-sobreposicao <0-1>` | Percentual de área a partir do qual bloqueia | `0.90` |
+| `--override-sobreposicao CODIGO:CODIGO:justificativa` | Libera um par bloqueado (ex.: vias paralelas); repetível | nenhum |
+
+```bash
+python cercas_v2.py --batch lote_modelo.csv --saida saida_lote.csv --relatorio relatorio.csv \
+  --limiar-sobreposicao 0.85 \
+  --override-sobreposicao "PRI - BR-116 - LUZ_MG - 60 KmH - 001:PRI - BR-116 - LUZ_MG - 60 KmH - 002:vias paralelas confirmadas em campo"
+```
+
+Sobreposições abaixo do limiar continuam apenas como alerta (comportamento
+herdado). "Quem confirmou" o override é capturado automaticamente do
+usuário do sistema operacional; a rastreabilidade completa (percentual,
+justificativa, confirmado por, quando) fica registrada no `--relatorio`.
+
 ## Testes
 
 ```bash
