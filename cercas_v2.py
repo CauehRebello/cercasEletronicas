@@ -62,6 +62,10 @@ from pyproj import Transformer
 from shapely.geometry import LineString, Point, Polygon
 from shapely.ops import substring as line_substring
 
+if sys.stdout.encoding != "utf-8":
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+
 # ─────────────────────────────────────────────────────────────────────────────
 # MÓDULO 1 — ENTRADA
 # ─────────────────────────────────────────────────────────────────────────────
@@ -447,10 +451,11 @@ def buscar_geometria_osm(
     lons = [ponto_inicio[1], ponto_fim[1]]
     bbox = f"{min(lats)-0.2},{min(lons)-0.2},{max(lats)+0.2},{max(lons)+0.2}"
 
+    ref_regex = re.escape(ref_ou_nome)
     query = f"""
 [out:json][timeout:{timeout_s}];
 (
-  way["ref"="{ref_ou_nome}"]["highway"]({bbox});
+  way["ref"~"(^|;){ref_regex}(;|$)"]["highway"]({bbox});
   way["name"="{ref_ou_nome}"]["highway"]({bbox});
 );
 (._;>;);
