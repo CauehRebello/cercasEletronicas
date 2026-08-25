@@ -241,6 +241,36 @@ def _haversine_m(p1: Tuple[float, float], p2: Tuple[float, float]) -> float:
     return 2 * R * math.asin(math.sqrt(a))
 
 
+def _dist_ponto_segmento_m(
+    ponto: Tuple[float, float], a: Tuple[float, float], b: Tuple[float, float]
+) -> float:
+    """Distância em metros de `ponto` ao segmento `a-b`, com projeção
+    ortogonal clampada aos extremos do segmento (distância ponto-segmento
+    padrão). Projeção feita em aproximação planar local (equirectangular,
+    compensando a compressão de longitude pelo cos da latitude média) —
+    aceitável para segmentos curtos (dezenas de metros). [FAT-333, FAT-357]
+    """
+    lat0 = math.radians((a[0] + b[0]) / 2.0)
+    cos_lat0 = math.cos(lat0) or 1e-12
+
+    def _para_plano(p):
+        return (p[1] * cos_lat0, p[0])  # (x=lon*cos(lat), y=lat)
+
+    px, py = _para_plano(ponto)
+    ax, ay = _para_plano(a)
+    bx, by = _para_plano(b)
+
+    dx, dy = bx - ax, by - ay
+    seg_len_sq = dx * dx + dy * dy
+    if seg_len_sq == 0.0:
+        return _haversine_m(ponto, a)
+
+    t = ((px - ax) * dx + (py - ay) * dy) / seg_len_sq
+    t = max(0.0, min(1.0, t))
+    proj = (ay + t * dy, (ax + t * dx) / cos_lat0)  # de volta a (lat, lon)
+    return _haversine_m(ponto, proj)
+
+
 def _overpass_query(
     q: str,
     max_tentativas: int = 3,
@@ -500,8 +530,13 @@ out body;
     melhor = None
     for nos in sequencias:
         coords_comp = [nodes[n] for n in nos]
-        d_ini = min(_haversine_m(ponto_inicio, c) for c in coords_comp)
-        d_fim = min(_haversine_m(ponto_fim, c) for c in coords_comp)
+        if len(coords_comp) >= 2:
+            segmentos = list(zip(coords_comp, coords_comp[1:]))
+            d_ini = min(_dist_ponto_segmento_m(ponto_inicio, a, b) for a, b in segmentos)
+            d_fim = min(_dist_ponto_segmento_m(ponto_fim, a, b) for a, b in segmentos)
+        else:
+            d_ini = min(_haversine_m(ponto_inicio, c) for c in coords_comp)
+            d_fim = min(_haversine_m(ponto_fim, c) for c in coords_comp)
         if melhor is None or (d_ini + d_fim) < melhor[0]:
             melhor = (d_ini + d_fim, coords_comp, d_ini, d_fim)
 

@@ -20,6 +20,7 @@ from cercas_v2 import (
     _cache_set,
     _checar_duplicidade_central,
     _costura_ways,
+    _dist_ponto_segmento_m,
     _haversine_m,
     _montar_codigo,
     _overpass_query,
@@ -81,6 +82,29 @@ def test_haversine_valor_conhecido():
     # 1 grau de latitude ≈ 111 km
     d = _haversine_m((0.0, 0.0), (1.0, 0.0))
     assert 110_000 < d < 112_000
+
+def test_dist_ponto_segmento_ponto_no_meio_de_nos_espacados():
+    # FAT-333: nós a ~250 m um do outro (comum em rodovias multiplexadas).
+    # Ponto a poucos metros do segmento, mas a mais de 100 m de cada nó
+    # individual — o bug antigo (distância ao nó mais próximo) rejeitaria
+    # essa coordenada; a distância ponto-segmento não deve.
+    a = (0.0, 0.0)
+    b = (0.002252, 0.0)  # ~250 m ao norte de `a`
+    ponto = (0.001126, 0.000027)  # meio do segmento, ~3 m a leste dele
+
+    d_no_a = _haversine_m(ponto, a)
+    d_no_b = _haversine_m(ponto, b)
+    assert d_no_a > _COSTURA_DIST_MAX_M and d_no_b > _COSTURA_DIST_MAX_M
+
+    d_segmento = _dist_ponto_segmento_m(ponto, a, b)
+    assert d_segmento < _COSTURA_DIST_MAX_M
+    assert d_segmento == pytest.approx(3.0, abs=1.0)
+
+def test_dist_ponto_segmento_projecao_fora_do_segmento_usa_extremo():
+    a = (0.0, 0.0)
+    b = (0.001, 0.0)
+    ponto = (0.01, 0.0)  # muito além de `b`, fora do segmento
+    assert _dist_ponto_segmento_m(ponto, a, b) == pytest.approx(_haversine_m(ponto, b))
 
 def test_utm_epsg_sul():
     # Curitiba está no hemisfério sul, zona 22S → EPSG:32722
