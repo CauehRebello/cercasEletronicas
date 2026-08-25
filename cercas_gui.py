@@ -9,11 +9,43 @@ externo do módulo (Cláusula V — aditivo, não substitutivo).
 """
 import contextlib
 import io
+import os
 import sys
 import tkinter as tk
 from tkinter import filedialog, scrolledtext, ttk
 
+import requests
+import tkintermapview
+
 import cercas_v2
+
+# Aba "Mapa" (DEC-V4-23/25) — consome o Bloco C (FastAPI), nunca acessa o
+# banco diretamente. Configurável para apontar para outra instância da API.
+API_BASE_URL = os.environ.get("CERCAS_GUI_API_URL", "http://localhost:8000")
+
+
+def _parse_wkt_linestring(wkt):
+    """Converte 'LINESTRING(lon1 lat1, lon2 lat2, ...)' em lista de
+    (lat, lon) para `tkintermapview.set_path`. Parse simples — o formato é
+    sempre gerado internamente pelo Bloco C (`api_cercas._wkt_linestring`),
+    não é WKT arbitrário de terceiros."""
+    if not wkt or not isinstance(wkt, str) or not wkt.upper().startswith("LINESTRING"):
+        return []
+    try:
+        corpo = wkt[wkt.index("(") + 1: wkt.rindex(")")]
+    except ValueError:
+        return []
+    pontos = []
+    for par in corpo.split(","):
+        partes = par.strip().split()
+        if len(partes) != 2:
+            continue
+        try:
+            lon, lat = float(partes[0]), float(partes[1])
+        except ValueError:
+            continue
+        pontos.append((lat, lon))
+    return pontos
 
 
 class CercasGUI(tk.Tk):
@@ -25,11 +57,20 @@ class CercasGUI(tk.Tk):
         self.usar_lote = tk.BooleanVar(value=False)
         self.campos = {}
 
-        self._construir_form()
+        notebook = ttk.Notebook(self)
+        notebook.pack(fill="both", expand=True)
+
+        aba_form = ttk.Frame(notebook)
+        aba_mapa = ttk.Frame(notebook)
+        notebook.add(aba_form, text="Gerar Cerca")
+        notebook.add(aba_mapa, text="Mapa")
+
+        self._construir_form(aba_form)
+        self._construir_mapa(aba_mapa)
 
     # ── Construção do formulário ───────────────────────────────────────────
-    def _construir_form(self):
-        container = ttk.Frame(self, padding=10)
+    def _construir_form(self, parent):
+        container = ttk.Frame(parent, padding=10)
         container.pack(fill="both", expand=True)
 
         ttk.Checkbutton(
@@ -125,6 +166,72 @@ class CercasGUI(tk.Tk):
         container.rowconfigure(linha, weight=1)
 
         self._atualizar_visibilidade()
+
+    # ── Aba "Mapa" (view-only, DEC-V4-23/25/26) ────────────────────────────
+    def _construir_mapa(self, parent):
+        container = ttk.Frame(parent, padding=10)
+        container.pack(fill="both", expand=True)
+
+        topo = ttk.Frame(container)
+        topo.pack(fill="x")
+        ttk.Button(topo, text="Recarregar", command=self._carregar_mapa).pack(side="left")
+        self.mapa_status = ttk.Label(topo, text="")
+        self.mapa_status.pack(side="left", padx=8)
+
+        self._mapa_frame = ttk.Frame(container)
+        self._mapa_frame.pack(fill="both", expand=True, pady=(8, 0))
+
+        self._carregar_mapa()
+
+    def _carregar_mapa(self):
+        """Busca GET /cercas/historico e desenha as geometrias com
+        tkintermapview. Nunca deve travar a GUI nem propagar exceção não
+        tratada — sem rede (API ou tiles), mostra aviso e retorna."""
+        for w in self._mapa_frame.winfo_children():
+            w.destroy()
+        self.mapa_status.config(text="")
+
+        try:
+            resposta = requests.get(f"{API_BASE_URL}/cercas/historico", timeout=5)
+            resposta.raise_for_status()
+            registros = resposta.json().get("registros", [])
+        except Exception as e:
+            ttk.Label(
+                self._mapa_frame,
+                text=f"Sem conexão com a API ({API_BASE_URL}) — mapa indisponível.\nDetalhe: {e}",
+                foreground="red", justify="left",
+            ).pack(anchor="w")
+            return
+
+        try:
+            map_widget = tkintermapview.TkinterMapView(self._mapa_frame, width=800, height=500)
+            map_widget.pack(fill="both", expand=True)
+
+            desenhadas = 0
+            primeiro_ponto = None
+            for registro in registros:
+                pontos = _parse_wkt_linestring(registro.get("geometria_wkt"))
+                if not pontos:
+                    continue
+                map_widget.set_path(pontos)
+                primeiro_ponto = primeiro_ponto or pontos[0]
+                desenhadas += 1
+
+            if primeiro_ponto:
+                map_widget.set_position(*primeiro_ponto)
+                map_widget.set_zoom(12)
+
+            self.mapa_status.config(
+                text=f"{desenhadas} cerca(s) com geometria desenhada(s) de {len(registros)} no histórico."
+            )
+        except Exception as e:
+            for w in self._mapa_frame.winfo_children():
+                w.destroy()
+            ttk.Label(
+                self._mapa_frame,
+                text=f"Sem conexão — mapa indisponível (falha ao carregar tiles).\nDetalhe: {e}",
+                foreground="red", justify="left",
+            ).pack(anchor="w")
 
     def _campo_texto(self, container, linha, chave, rotulo):
         ttk.Label(container, text=rotulo).grid(row=linha, column=0, sticky="w")

@@ -6,3 +6,4 @@ __pycache__/
 !requirements.txt
 HandoffImplementacao_ClaudeCode_v3.md
 .env
+.claude/

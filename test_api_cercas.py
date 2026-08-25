@@ -179,6 +179,26 @@ def test_criar_cerca_osm_nao_encontrado(client, monkeypatch):
     assert resp.status_code == 502
 
 
+def test_criar_cerca_grava_geometria_wkt(client):
+    """DEC-V4-27: geometria_wkt gravada já na criação, sem endpoint novo."""
+    conn = cv._FakeCentralConn()
+    _usar_fake_conn(conn)
+    body = {
+        "modo": "B",
+        "polilinha": "-25.000000,-49.000000;-25.001000,-49.000000",
+        "inicio": "-25.000000,-49.000000",
+        "comprimento": 10,
+        "rodovia": "BR-116", "cidade": "TESTE", "uf": "MG",
+        "velocidade": 60, "seq": 1,
+    }
+    resp = client.post("/cercas", json=body)
+    assert resp.status_code == 201, resp.text
+    assert conn.rows
+    for row in conn.rows:
+        assert row["geometria_wkt"].startswith("LINESTRING(")
+        assert row["geometria_wkt"].endswith(")")
+
+
 def test_criar_cerca_via_e_polilinha_mutuamente_exclusivos(client):
     _usar_fake_conn(cv._FakeCentralConn())
     body = {
@@ -245,6 +265,21 @@ def test_lote_nao_usa_dependency_get_pg_conn(client, monkeypatch):
     monkeypatch.setenv("CERCAS_API_PG_FAKE", "1")
     resp = _upload_lote(client, [_linha_lote_dict()])
     assert resp.status_code == 200, resp.text
+
+
+def test_lote_grava_geometria_wkt(client, monkeypatch):
+    """DEC-V4-27: /cercas/lote também grava geometria_wkt já nesta entrega,
+    reaproveitando os vertices já retornados por `cv.processar_lote` —
+    verificado via UPDATE pós-fato na mesma conexão fake compartilhada."""
+    conn_compartilhada = cv._FakeCentralConn()
+    monkeypatch.setattr(cv, "_obter_conexao_central", lambda dsn, usar_fake=False, verbose=True: conn_compartilhada)
+    monkeypatch.setenv("CERCAS_API_PG_FAKE", "1")
+
+    resp = _upload_lote(client, [_linha_lote_dict()])
+    assert resp.status_code == 200, resp.text
+    assert conn_compartilhada.rows
+    for row in conn_compartilhada.rows:
+        assert row["geometria_wkt"].startswith("LINESTRING(")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -382,3 +417,34 @@ def test_historico_com_dados_filtro_e_status_superado(client):
 
     resp_sem_match = client.get("/cercas/historico", params={"rodovia": "RS-135"})
     assert resp_sem_match.json() == {"total": 0, "registros": []}
+
+
+def test_historico_retorna_geometria_wkt(client):
+    """DEC-V4-25: historico estendido para incluir geometria_wkt, sem
+    endpoint novo. Linha sem geometria_wkt (histórico ainda não migrado
+    pelo backfill) volta como None, não quebra a resposta."""
+    conn = cv._FakeCentralConn()
+    conn.rows.append({
+        "codigo": "PRI - BR-116 - TESTE_MG - 60 KmH - 001", "tipo": "PRI",
+        "rodovia": "BR-116", "cidade": "TESTE", "uf": "MG", "velocidade": 60, "seq": 1,
+        "extensao_m": 10, "vertice_inicial": "-25.0,-49.0", "vertice_final": "-25.001,-49.0",
+        "num_vertices": 4, "data_criacao": "", "execucao_id": "x", "status": "ativo",
+        "superado_em": None, "superado_motivo": None,
+        "geometria_wkt": "LINESTRING(-49.000000 -25.000000, -49.000000 -25.001000)",
+    })
+    conn.rows.append({
+        "codigo": "PRI - BR-116 - TESTE_MG - 60 KmH - 002", "tipo": "PRI",
+        "rodovia": "BR-116", "cidade": "TESTE", "uf": "MG", "velocidade": 60, "seq": 2,
+        "extensao_m": 10, "vertice_inicial": "", "vertice_final": "", "num_vertices": 4,
+        "data_criacao": "", "execucao_id": "y", "status": "ativo",
+        "superado_em": None, "superado_motivo": None,
+    })
+    _usar_fake_conn(conn)
+
+    resp = client.get("/cercas/historico")
+    assert resp.status_code == 200
+    registros = {r["codigo"]: r for r in resp.json()["registros"]}
+    assert registros["PRI - BR-116 - TESTE_MG - 60 KmH - 001"]["geometria_wkt"] == (
+        "LINESTRING(-49.000000 -25.000000, -49.000000 -25.001000)"
+    )
+    assert registros["PRI - BR-116 - TESTE_MG - 60 KmH - 002"]["geometria_wkt"] is None

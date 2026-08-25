@@ -195,7 +195,43 @@ _COLUNAS_CERCAS_CENTRAL = (
     "codigo", "tipo", "rodovia", "cidade", "uf", "velocidade", "seq",
     "extensao_m", "vertice_inicial", "vertice_final", "num_vertices",
     "data_criacao", "execucao_id", "status", "superado_em", "superado_motivo",
+    "geometria_wkt",
 )
+
+
+def _wkt_linestring(vertices: List) -> Optional[str]:
+    """Converte a lista de vértices (lat, lon) já calculada pelo Módulo 4
+    (mesma lista usada para vertice_inicial/vertice_final) em WKT LINESTRING
+    (lon lat, ...). Sem cálculo geométrico novo — só formatação. DEC-V4-21."""
+    if not vertices or len(vertices) < 2:
+        return None
+    pontos = ", ".join(f"{lon:.6f} {lat:.6f}" for lat, lon in vertices)
+    return f"LINESTRING({pontos})"
+
+
+def _gravar_geometria_wkt(conn, registros: List[Dict]) -> None:
+    """Grava geometria_wkt para cada registro já inserido por
+    `cv.registrar_cerca_central`/`cv.processar_lote` (núcleo, intocado) —
+    UPDATE separado, pois o INSERT do núcleo não conhece essa coluna
+    (DEC-V4-27). Mesmo tratamento de `_FakeCentralConn` que
+    `_consultar_cercas_central` (ver docstring lá): o parser de SQL do fake
+    (`cercas_v2._FakeCentralCursor`) só reconhece os 4 padrões do Bloco A,
+    então em modo fake a atualização é feita direto em `conn.rows`."""
+    for registro in registros:
+        wkt = _wkt_linestring(registro.get("vertices", []))
+        if wkt is None:
+            continue
+        if isinstance(conn, cv._FakeCentralConn):
+            for row in conn.rows:
+                if row["codigo"] == registro["codigo"] and row["status"] == "ativo":
+                    row["geometria_wkt"] = wkt
+            continue
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE cercas_central SET geometria_wkt = %s WHERE codigo = %s AND status = 'ativo'",
+            (wkt, registro["codigo"]),
+        )
+        conn.commit()
 
 
 def _consultar_cercas_central(conn, filtros: Dict[str, str]) -> List[Dict]:
@@ -263,12 +299,13 @@ def _processar_lote_arquivo(
         with open(caminho_entrada, "wb") as f:
             f.write(conteudo)
 
+        dsn, fake = _pg_dsn_config(), _pg_fake_config()
         try:
-            total, _registros, sobreposicoes, bloqueios = cv.processar_lote(
+            total, registros, sobreposicoes, bloqueios = cv.processar_lote(
                 caminho_entrada, caminho_saida, verbose=False,
                 caminho_relatorio=caminho_relatorio,
                 max_tentativas=max_tentativas, espera_base_s=espera_base_s, timeout_s=timeout_s,
-                pg_dsn=_pg_dsn_config(), pg_fake=_pg_fake_config(),
+                pg_dsn=dsn, pg_fake=fake,
                 limiar_sobreposicao=_limiar_sobreposicao_config(),
                 overrides_sobreposicao=overrides_sobreposicao,
             )
@@ -291,6 +328,13 @@ def _processar_lote_arquivo(
 
         with open(caminho_relatorio, "r", encoding="utf-8") as f:
             relatorio_csv = f.read()
+
+        if dsn or fake:
+            conn = cv._obter_conexao_central(dsn, usar_fake=fake, verbose=False)
+            try:
+                _gravar_geometria_wkt(conn, registros)
+            finally:
+                conn.close()
 
     bloqueios_ativos = [b for b in bloqueios if b["bloqueado"]]
     resposta = {
@@ -407,6 +451,7 @@ def criar_cerca(body: CercaRequest, conn=Depends(get_pg_conn)):
     execucao_id = datetime.now().strftime("%Y%m%d%H%M%S%f")
     for registro in registros:
         cv.registrar_cerca_central(conn, registro, execucao_id)
+    _gravar_geometria_wkt(conn, registros)
 
     return {
         "execucao_id": execucao_id,

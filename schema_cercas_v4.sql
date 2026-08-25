@@ -44,7 +44,8 @@ CREATE TABLE public.cercas_central (
     execucao_id text,
     status text DEFAULT 'ativo'::text NOT NULL,
     superado_em text,
-    superado_motivo text
+    superado_motivo text,
+    geometria_wkt text
 );
 
 
