@@ -301,7 +301,8 @@ def _processar_lote_arquivo(
 
         dsn, fake = _pg_dsn_config(), _pg_fake_config()
         try:
-            total, registros, sobreposicoes, bloqueios = cv.processar_lote(
+            (total, registros, sobreposicoes, bloqueios,
+             pendencias_via_alternativa, vias_alternativas_aceitas) = cv.processar_lote(
                 caminho_entrada, caminho_saida, verbose=False,
                 caminho_relatorio=caminho_relatorio,
                 max_tentativas=max_tentativas, espera_base_s=espera_base_s, timeout_s=timeout_s,
@@ -343,6 +344,8 @@ def _processar_lote_arquivo(
             {"codigo_a": a, "codigo_b": b} for a, b in sobreposicoes
         ],
         "bloqueios_sobreposicao": bloqueios,
+        "pendencias_via_alternativa": pendencias_via_alternativa,
+        "vias_alternativas_aceitas": vias_alternativas_aceitas,
         "relatorio_csv": relatorio_csv,
     }
 

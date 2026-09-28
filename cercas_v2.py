@@ -215,7 +215,7 @@ def ler_lote(caminho: str) -> List[Dict[str, str]]:
 # MÓDULO 2 — GEOMETRIA OSM (costura de ways)  [FAT-24]
 # ─────────────────────────────────────────────────────────────────────────────
 
-OVERPASS_URL = "https://lz4.overpass-api.de/api/interpreter"
+OVERPASS_URL = "https://overpass.openstreetmap.fr/api/interpreter"
 OVERPASS_TIMEOUT = 30
 
 # Distância máxima (m) de início/fim ao componente escolhido — 2x o buffer_m
@@ -443,6 +443,33 @@ def _cache_set(chave: str, valor: List[Tuple[float, float]], ttl_s: float, camin
         json.dump(dados, f)
 
 
+def _selecionar_componente_mais_proximo(
+    sequencias: List[List[int]],
+    nodes: dict,
+    ponto_inicio: Tuple[float, float],
+    ponto_fim: Tuple[float, float],
+) -> Tuple[List[Tuple[float, float]], float, float]:
+    """Dentre os componentes costurados, retorna (coords, d_ini, d_fim) do
+    componente com menor d_ini+d_fim (distância de início/fim ao trecho).
+    Extraído de `buscar_geometria_osm` para reuso em busca de vias
+    alternativas.  [DEC-V4-32]
+    """
+    melhor = None
+    for nos in sequencias:
+        coords_comp = [nodes[n] for n in nos]
+        if len(coords_comp) >= 2:
+            segmentos = list(zip(coords_comp, coords_comp[1:]))
+            d_ini = min(_dist_ponto_segmento_m(ponto_inicio, a, b) for a, b in segmentos)
+            d_fim = min(_dist_ponto_segmento_m(ponto_fim, a, b) for a, b in segmentos)
+        else:
+            d_ini = min(_haversine_m(ponto_inicio, c) for c in coords_comp)
+            d_fim = min(_haversine_m(ponto_fim, c) for c in coords_comp)
+        if melhor is None or (d_ini + d_fim) < melhor[0]:
+            melhor = (d_ini + d_fim, coords_comp, d_ini, d_fim)
+    _, coords, d_ini, d_fim = melhor
+    return coords, d_ini, d_fim
+
+
 def buscar_geometria_osm(
     ref_ou_nome: str,
     ponto_inicio: Tuple[float, float],
@@ -525,22 +552,8 @@ out body;
             print("  ⚠  Costura de ways falhou.")
         return None
 
-    # Escolhe o componente mais próximo de início/fim — via pode estar
-    # fragmentada em trechos desconexos dentro da bbox.  [FAT-68, DEC-6]
-    melhor = None
-    for nos in sequencias:
-        coords_comp = [nodes[n] for n in nos]
-        if len(coords_comp) >= 2:
-            segmentos = list(zip(coords_comp, coords_comp[1:]))
-            d_ini = min(_dist_ponto_segmento_m(ponto_inicio, a, b) for a, b in segmentos)
-            d_fim = min(_dist_ponto_segmento_m(ponto_fim, a, b) for a, b in segmentos)
-        else:
-            d_ini = min(_haversine_m(ponto_inicio, c) for c in coords_comp)
-            d_fim = min(_haversine_m(ponto_fim, c) for c in coords_comp)
-        if melhor is None or (d_ini + d_fim) < melhor[0]:
-            melhor = (d_ini + d_fim, coords_comp, d_ini, d_fim)
-
-    _, coords, d_ini, d_fim = melhor
+    melhor = _selecionar_componente_mais_proximo(sequencias, nodes, ponto_inicio, ponto_fim)
+    coords, d_ini, d_fim = melhor
     if d_ini > _COSTURA_DIST_MAX_M or d_fim > _COSTURA_DIST_MAX_M:
         if verbose:
             print(f"  ⚠  Nenhum trecho de '{ref_ou_nome}' passa perto de "
@@ -560,6 +573,127 @@ out body;
         _cache_set(chave_cache, coords, cache_ttl_s)
 
     return coords
+
+
+def buscar_vias_alternativas_osm(
+    ponto_inicio: Tuple[float, float],
+    ponto_fim: Tuple[float, float],
+    ref_ou_nome_excluir: str,
+    verbose: bool = True,
+    max_tentativas: int = 3,
+    espera_base_s: float = 3.0,
+    timeout_s: int = OVERPASS_TIMEOUT,
+    limite_candidatos: int = 5,
+) -> List[Dict]:
+    """
+    Busca no OSM vias alternativas (qualquer ref/nome) próximas a
+    `ponto_inicio`/`ponto_fim`, para o caso em que `buscar_geometria_osm` não
+    encontrou a via pedida (`ref_ou_nome_excluir`) dentro do limiar de
+    `_COSTURA_DIST_MAX_M`. Nunca escolhe automaticamente — apenas relata
+    candidatas para confirmação explícita do operador.  [DEC-V4-32]
+
+    Diferente de `buscar_geometria_osm`, a query não filtra por ref/name
+    (para achar QUALQUER via próxima), então `_costura_ways` é aplicada por
+    grupo de identidade (ref, senão name, senão way isolado) — nunca sobre o
+    conjunto bruto, para não costurar vias diferentes que se cruzam num nó.
+
+    Retorna lista de até `limite_candidatos` dicts
+    `{"way_id_referencia", "nome_ou_ref", "d_ini", "d_fim", "coords"}`,
+    ordenada por `d_ini+d_fim` ascendente. Lista vazia se nada encontrado ou
+    em caso de erro de rede. Nunca levanta exceção.
+    """
+    lats = [ponto_inicio[0], ponto_fim[0]]
+    lons = [ponto_inicio[1], ponto_fim[1]]
+    bbox = f"{min(lats)-0.2},{min(lons)-0.2},{max(lats)+0.2},{max(lons)+0.2}"
+
+    query = f"""
+[out:json][timeout:{timeout_s}];
+way["highway"]({bbox});
+(._;>;);
+out body;
+"""
+    try:
+        dados = _overpass_query(
+            query,
+            max_tentativas=max_tentativas,
+            espera_base_s=espera_base_s,
+            timeout_s=timeout_s,
+        )
+    except Exception as e:
+        if verbose:
+            print(f"  ⚠  Erro ao buscar vias alternativas no OSM: {e}")
+        return []
+
+    nodes: dict = {}
+    ways: list = []
+    for el in dados.get("elements", []):
+        if el["type"] == "node":
+            nodes[el["id"]] = (el["lat"], el["lon"])
+        elif el["type"] == "way":
+            ways.append(el)
+
+    grupos: Dict[str, list] = {}
+    for w in ways:
+        tags = w.get("tags", {})
+        chave = tags.get("ref") or tags.get("name") or f"__sem_id_{w['id']}__"
+        grupos.setdefault(chave, []).append(w)
+
+    grupos.pop(ref_ou_nome_excluir, None)
+
+    candidatos = []
+    for nome_ou_ref, ways_grupo in grupos.items():
+        sequencias = _costura_ways(ways_grupo, nodes)
+        if not sequencias:
+            continue
+        coords, d_ini, d_fim = _selecionar_componente_mais_proximo(
+            sequencias, nodes, ponto_inicio, ponto_fim
+        )
+        if d_ini > _COSTURA_DIST_MAX_M or d_fim > _COSTURA_DIST_MAX_M:
+            continue
+        way_id_referencia = min(
+            ways_grupo,
+            key=lambda w: min(_haversine_m(ponto_inicio, nodes[n]) for n in w["nodes"] if n in nodes),
+        )["id"]
+        candidatos.append({
+            "way_id_referencia": way_id_referencia,
+            "nome_ou_ref": nome_ou_ref,
+            "d_ini": d_ini,
+            "d_fim": d_fim,
+            "coords": coords,
+        })
+
+    candidatos.sort(key=lambda c: c["d_ini"] + c["d_fim"])
+    return candidatos[:limite_candidatos]
+
+
+class ViaAlternativaPendenteError(RuntimeError):
+    """Via referenciada não encontrada, mas há via(s) alternativa(s) perto do
+    início/fim ainda não confirmadas via --aceitar-via-alternativa.
+    [DEC-V4-32]
+    """
+
+    def __init__(self, codigo_base: str, via_original: str, num_linha, candidatos: List[Dict]):
+        self.codigo_base = codigo_base
+        self.via_original = via_original
+        self.num_linha = num_linha
+        self.candidatos = candidatos
+        super().__init__(self._montar_mensagem())
+
+    def _montar_mensagem(self) -> str:
+        linhas = [
+            f"Lote, linha {self.num_linha}: geometria não encontrada no OSM para "
+            f"'{self.via_original}', mas {len(self.candidatos)} via(s) alternativa(s) "
+            f"foram encontradas perto do início/fim. Nenhuma foi aceita "
+            f"automaticamente. Confirme com --aceitar-via-alternativa:"
+        ]
+        for c in self.candidatos:
+            linhas.append(
+                f"  --aceitar-via-alternativa "
+                f"'{self.codigo_base}:{c['way_id_referencia']}:<justificativa>'"
+                f"   # '{c['nome_ou_ref']}', início {c['d_ini']:.0f} m, fim {c['d_fim']:.0f} m"
+                f"   (https://www.openstreetmap.org/way/{c['way_id_referencia']})"
+            )
+        return "\n".join(linhas)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -891,17 +1025,22 @@ def processar_linha_lote(
     substituir: bool = False,
     confirmar_substituicao: bool = False,
     motivo_substituicao: Optional[str] = None,
-) -> Tuple[List[str], List[Dict]]:
+    overrides_via_alternativa: Optional[Dict[Tuple[str, str], Dict]] = None,
+) -> Tuple[List[str], List[Dict], Optional[Dict]]:
     """
     Processa UMA linha do arquivo de lote: geometria → buffer/recorte →
     montagem das linhas SASCAR (sem escrever em disco).
     Reusa exatamente os módulos 2, 3 e 4 originais — nenhum invariante
-    alterado. Retorna (linhas_sascar, registros_estruturados):
+    alterado. Retorna (linhas_sascar, registros_estruturados, via_alternativa_aceita):
       - linhas_sascar: linhas SASCAR (PRI [+ PRE]) desta cerca — comportamento
         idêntico ao original.
       - registros_estruturados: mesma informação em forma de dict (codigo,
         tipo, seq, vertices, extensao_m), usada pelos Módulos 7/8
         (sobreposição/relatório, FAT-78) sem duplicar cálculo de geometria.
+      - via_alternativa_aceita: dict de rastreabilidade (via_original, way_id,
+        nome_ou_ref, justificativa, confirmado_por, quando) se esta linha usou
+        uma via alternativa confirmada via `overrides_via_alternativa`, ou
+        `None` caso contrário.  [DEC-V4-32]
 
     `max_tentativas`, `espera_base_s` e `timeout_s` são repassados a
     `buscar_geometria_osm` (padrões idênticos ao comportamento anterior).  [FAT-119, S7]
@@ -913,6 +1052,12 @@ def processar_linha_lote(
     `DuplicidadeCodigoCentralError` se já existir CÓDIGO ativo para a mesma
     combinação rodovia/cidade/UF/velocidade/SEQ e a substituição
     (`substituir` + `confirmar_substituicao`) não tiver sido solicitada.
+
+    `overrides_via_alternativa` (DEC-V4-32): se a via referenciada em `via`
+    não for encontrada dentro do limiar mas houver via(s) alternativa(s)
+    próximas, busca confirmação nesse dict (chave `(codigo_base, way_id)`).
+    Sem confirmação, levanta `ViaAlternativaPendenteError` (nunca aceita
+    automaticamente — risco de segurança viária).
     """
     num_linha = row.get("_num_linha", "?")
 
@@ -943,6 +1088,7 @@ def processar_linha_lote(
 
     via       = (row.get("via") or "").strip()
     polilinha_manual = (row.get("polilinha") or "").strip()
+    via_alternativa_aceita: Optional[Dict] = None
 
     if polilinha_manual:
         polilinha = parse_polilinha_manual(polilinha_manual)
@@ -954,10 +1100,36 @@ def processar_linha_lote(
             usar_cache=usar_cache, cache_ttl_s=cache_ttl_s,
         )
         if not polilinha:
-            raise RuntimeError(
-                f"Lote, linha {num_linha}: geometria não encontrada no OSM para '{via}'. "
-                f"Use a coluna 'polilinha' para fallback manual. [FAT-24]"
+            codigo_base = _montar_codigo(
+                "PRI", row["rodovia"], row["cidade"], row["uf"], int(row["velocidade"]), seq
             )
+            candidatos = buscar_vias_alternativas_osm(
+                inicio, ponto_bbox_fim, via, verbose=verbose,
+                max_tentativas=max_tentativas, espera_base_s=espera_base_s, timeout_s=timeout_s,
+            )
+            if not candidatos:
+                raise RuntimeError(
+                    f"Lote, linha {num_linha}: geometria não encontrada no OSM para '{via}'. "
+                    f"Nenhuma via alternativa próxima foi encontrada. "
+                    f"Use a coluna 'polilinha' para fallback manual. [FAT-24]"
+                )
+            escolhido = None
+            override = None
+            for cand in candidatos:
+                chave = (codigo_base, str(cand["way_id_referencia"]))
+                if overrides_via_alternativa and chave in overrides_via_alternativa:
+                    escolhido = cand
+                    override = overrides_via_alternativa[chave]
+                    break
+            if escolhido is None:
+                raise ViaAlternativaPendenteError(codigo_base, via, num_linha, candidatos)
+            polilinha = escolhido["coords"]
+            via_alternativa_aceita = {
+                "codigo_base": codigo_base, "via_original": via,
+                "way_id": escolhido["way_id_referencia"], "nome_ou_ref": escolhido["nome_ou_ref"],
+                "d_ini": escolhido["d_ini"], "d_fim": escolhido["d_fim"],
+                **override,
+            }
 
     cercas = gerar_cercas(
         polilinha=polilinha, modo=modo, inicio=inicio, fim=fim,
@@ -983,9 +1155,10 @@ def processar_linha_lote(
             "vertices": vertices, "extensao_m": dados.get("extensao_m", 0),
             "rodovia": row["rodovia"], "cidade": row["cidade"], "uf": row["uf"],
             "velocidade": int(row["velocidade"]),
+            "via_alternativa_aceita": via_alternativa_aceita,
         })
 
-    return linhas_sascar, registros_estruturados
+    return linhas_sascar, registros_estruturados, via_alternativa_aceita
 
 
 def processar_lote(
@@ -1006,11 +1179,13 @@ def processar_lote(
     motivo_substituicao: Optional[str] = None,
     limiar_sobreposicao: float = LIMIAR_SOBREPOSICAO_BLOQUEIO_PADRAO,
     overrides_sobreposicao: Optional[Dict[Tuple[str, str], Dict]] = None,
-) -> Tuple[int, List[Dict], List[Tuple[str, str]], List[Dict]]:
+    overrides_via_alternativa: Optional[Dict[Tuple[str, str], Dict]] = None,
+) -> Tuple[int, List[Dict], List[Tuple[str, str]], List[Dict], List[Dict], List[Dict]]:
     """
     Lê o arquivo de lote, gera todas as cercas e exporta UM único arquivo
     consolidado.  [FAT-63, DEC-3]
-    Retorna (total_gravado, registros_estruturados, sobreposicoes, bloqueios_sobreposicao):
+    Retorna (total_gravado, registros_estruturados, sobreposicoes,
+    bloqueios_sobreposicao, pendencias_via_alternativa, vias_alternativas_aceitas):
       - total_gravado: número de registros SASCAR gravados (comportamento
         original, inalterado).
       - registros_estruturados: dados de cada cerca (codigo/tipo/seq/
@@ -1021,10 +1196,24 @@ def processar_lote(
       - bloqueios_sobreposicao (Bloco B v4, [FAT-203]): pares acima do
         limiar de bloqueio, sempre avaliados (independente de
         `caminho_relatorio`) — ver `avaliar_bloqueio_sobreposicao`.
+      - pendencias_via_alternativa (DEC-V4-32): linhas cuja via não foi
+        encontrada mas têm via(s) alternativa(s) próximas ainda não
+        confirmadas — ver nota abaixo sobre a exceção ao tudo-ou-nada.
+      - vias_alternativas_aceitas (DEC-V4-32): rastreabilidade das linhas
+        que usaram via alternativa confirmada via `overrides_via_alternativa`.
     Propaga o erro da primeira linha inválida (sem gravar arquivo parcial) —
     R6/R2: falha explícita, nunca resultado parcial silencioso. Isso também
     vale para bloqueio de duplicidade central (Bloco A v4, [FAT-181]): se
     qualquer linha for recusada, nenhum arquivo é exportado.
+
+    ÚNICA EXCEÇÃO a esse tudo-ou-nada (DEC-V4-32, estritamente limitada a
+    este caso): uma linha que falha por via alternativa pendente (via
+    referenciada não encontrada, mas há candidata próxima sem confirmação em
+    `overrides_via_alternativa`) NÃO aborta o lote — vira uma pendência em
+    `pendencias_via_alternativa` e o processamento continua para as demais
+    linhas. Qualquer outro tipo de erro de linha (geometria realmente
+    ausente, duplicidade central, validação de campo) continua abortando o
+    lote inteiro sem nenhuma mudança de comportamento.
 
     `max_tentativas`, `espera_base_s` e `timeout_s` são repassados a
     `processar_linha_lote` (padrões idênticos ao comportamento anterior).  [FAT-119, S7]
@@ -1042,6 +1231,8 @@ def processar_lote(
     PostgreSQL real — só para demonstração/teste, nunca em produção.
     `limiar_sobreposicao`/`overrides_sobreposicao` (Bloco B v4, [FAT-203,
     FAT-185, FAT-186]) controlam o bloqueio de sobreposição geométrica.
+    `overrides_via_alternativa` (DEC-V4-32) confirma vias alternativas
+    aceitas — ver nota acima.
     """
     linhas_lote = ler_lote(caminho_entrada)
     if verbose:
@@ -1054,17 +1245,34 @@ def processar_lote(
 
         todas_linhas: List[str] = []
         todos_registros: List[Dict] = []
+        pendencias_via_alternativa: List[Dict] = []
+        vias_alternativas_aceitas: List[Dict] = []
         for row in linhas_lote:
-            linhas_sascar, registros = processar_linha_lote(
-                row, verbose=verbose,
-                max_tentativas=max_tentativas, espera_base_s=espera_base_s, timeout_s=timeout_s,
-                usar_cache=usar_cache, cache_ttl_s=cache_ttl_s,
-                pg_conn=pg_conn, substituir=substituir,
-                confirmar_substituicao=confirmar_substituicao,
-                motivo_substituicao=motivo_substituicao,
-            )
+            try:
+                linhas_sascar, registros, via_alt = processar_linha_lote(
+                    row, verbose=verbose,
+                    max_tentativas=max_tentativas, espera_base_s=espera_base_s, timeout_s=timeout_s,
+                    usar_cache=usar_cache, cache_ttl_s=cache_ttl_s,
+                    pg_conn=pg_conn, substituir=substituir,
+                    confirmar_substituicao=confirmar_substituicao,
+                    motivo_substituicao=motivo_substituicao,
+                    overrides_via_alternativa=overrides_via_alternativa,
+                )
+            except ViaAlternativaPendenteError as e:
+                # ÚNICA exceção ao tudo-ou-nada (R6/R2) — estritamente
+                # limitada a este caso. Qualquer outro erro de linha
+                # continua propagando e abortando o lote inteiro. [DEC-V4-32]
+                pendencias_via_alternativa.append({
+                    "num_linha": e.num_linha, "codigo_base": e.codigo_base,
+                    "via_original": e.via_original, "candidatos": e.candidatos,
+                })
+                if verbose:
+                    print(f"  ⚠ {e}")
+                continue
             todas_linhas.extend(linhas_sascar)
             todos_registros.extend(registros)
+            if via_alt:
+                vias_alternativas_aceitas.append(via_alt)
 
         total = exportar_lote(todas_linhas, caminho_saida, verbose=verbose)
 
@@ -1083,7 +1291,9 @@ def processar_lote(
             if verbose:
                 print(f"\n[MÓDULO 8] Gerando relatório '{caminho_relatorio}'...  [FAT-78, S5]")
             gerar_relatorio(todos_registros, caminho_relatorio, sobreposicoes, verbose=verbose,
-                             bloqueios_sobreposicao=bloqueios_sobreposicao)
+                             bloqueios_sobreposicao=bloqueios_sobreposicao,
+                             pendencias_via_alternativa=pendencias_via_alternativa,
+                             vias_alternativas_aceitas=vias_alternativas_aceitas)
 
         if caminho_historico:
             if verbose:
@@ -1097,7 +1307,8 @@ def processar_lote(
             for registro in todos_registros:
                 registrar_cerca_central(pg_conn, registro, execucao_id_central)
 
-        return total, todos_registros, sobreposicoes, bloqueios_sobreposicao
+        return (total, todos_registros, sobreposicoes, bloqueios_sobreposicao,
+                pendencias_via_alternativa, vias_alternativas_aceitas)
     finally:
         if pg_conn is not None:
             pg_conn.close()
@@ -1265,6 +1476,8 @@ def gerar_relatorio(
     sobreposicoes: Optional[List[Tuple[str, str]]] = None,
     verbose: bool = True,
     bloqueios_sobreposicao: Optional[List[Dict]] = None,
+    pendencias_via_alternativa: Optional[List[Dict]] = None,
+    vias_alternativas_aceitas: Optional[List[Dict]] = None,
 ) -> int:
     """
     Grava um relatório CSV com o resumo das cercas geradas nesta execução.
@@ -1278,6 +1491,12 @@ def gerar_relatorio(
     uma seção com os pares avaliados acima do limiar de bloqueio, incluindo
     override manual (justificativa, quem confirmou, quando) quando existir —
     preserva a rastreabilidade exigida para o override. [FAT-186]
+
+    `pendencias_via_alternativa`/`vias_alternativas_aceitas` (DEC-V4-32): se
+    informados, acrescentam seções com as linhas do lote que ficaram
+    pendentes de confirmação de via alternativa e as que já foram
+    confirmadas (com a mesma rastreabilidade de justificativa/confirmado_por/
+    quando do override de sobreposição).
 
     Retorna o número de cercas (linhas) registradas no relatório.
     """
@@ -1321,6 +1540,35 @@ def gerar_relatorio(
                     override.get("justificativa", ""),
                     override.get("confirmado_por", ""),
                     override.get("quando", ""),
+                ])
+
+        if pendencias_via_alternativa:
+            writer.writerow([])
+            writer.writerow(["PENDENCIA DE VIA ALTERNATIVA (DEC-V4-32) - linha nao processada, lote continua"])
+            writer.writerow([
+                "num_linha", "codigo_base", "via_original", "way_id_referencia",
+                "nome_ou_ref", "d_ini_m", "d_fim_m", "comando_sugerido",
+            ])
+            for p in pendencias_via_alternativa:
+                for c in p["candidatos"]:
+                    writer.writerow([
+                        p["num_linha"], p["codigo_base"], p["via_original"],
+                        c["way_id_referencia"], c["nome_ou_ref"],
+                        f"{c['d_ini']:.0f}", f"{c['d_fim']:.0f}",
+                        f"--aceitar-via-alternativa '{p['codigo_base']}:{c['way_id_referencia']}:<justificativa>'",
+                    ])
+
+        if vias_alternativas_aceitas:
+            writer.writerow([])
+            writer.writerow(["VIA ALTERNATIVA ACEITA (DEC-V4-32) - rastreabilidade"])
+            writer.writerow([
+                "codigo_base", "via_original", "way_id_usado", "nome_ou_ref",
+                "justificativa", "confirmado_por", "quando",
+            ])
+            for v in vias_alternativas_aceitas:
+                writer.writerow([
+                    v["codigo_base"], v["via_original"], v["way_id"], v["nome_ou_ref"],
+                    v["justificativa"], v["confirmado_por"], v["quando"],
                 ])
 
     if verbose:
@@ -1557,13 +1805,21 @@ class _FakeCentralCursor:
             return
         if s.startswith("INSERT"):
             (codigo, tipo, rodovia, cidade, uf, velocidade, seq, extensao_m,
-             v_ini, v_fim, num_vertices, data_criacao, execucao_id) = params
+             v_ini, v_fim, num_vertices, data_criacao, execucao_id,
+             via_alt_original, via_alt_way_id, via_alt_justificativa,
+             via_alt_confirmado_por, via_alt_quando, geometria_wkt) = params
             self._conn.rows.append({
                 "codigo": codigo, "tipo": tipo, "rodovia": rodovia, "cidade": cidade,
                 "uf": uf, "velocidade": velocidade, "seq": seq, "extensao_m": extensao_m,
                 "vertice_inicial": v_ini, "vertice_final": v_fim, "num_vertices": num_vertices,
                 "data_criacao": data_criacao, "execucao_id": execucao_id,
                 "status": "ativo", "superado_em": None, "superado_motivo": None,
+                "via_alternativa_original": via_alt_original,
+                "via_alternativa_way_id": via_alt_way_id,
+                "via_alternativa_justificativa": via_alt_justificativa,
+                "via_alternativa_confirmado_por": via_alt_confirmado_por,
+                "via_alternativa_quando": via_alt_quando,
+                "geometria_wkt": geometria_wkt,
             })
             return
         raise AssertionError(f"SQL não esperado no _FakeCentralConn: {sql}")
@@ -1626,7 +1882,13 @@ def _pg_criar_tabela(conn) -> None:
             execucao_id      TEXT,
             status           TEXT NOT NULL DEFAULT 'ativo',
             superado_em      TEXT,
-            superado_motivo  TEXT
+            superado_motivo  TEXT,
+            via_alternativa_original       TEXT,
+            via_alternativa_way_id         TEXT,
+            via_alternativa_justificativa  TEXT,
+            via_alternativa_confirmado_por TEXT,
+            via_alternativa_quando         TEXT,
+            geometria_wkt                  TEXT
         )
     """)
     conn.commit()
@@ -1702,25 +1964,45 @@ def substituir_cerca_central(
     return n
 
 
+def _wkt_linestring(vertices: List) -> Optional[str]:
+    """Converte a lista de vértices (lat, lon) do polígono com buffer já
+    calculado pelo Módulo 4 em WKT LINESTRING (lon lat, ...) — mesmo formato
+    gravado pelo caminho da API (`api_cercas._wkt_linestring`, DEC-V4-21).
+    Sem cálculo geométrico novo — só formatação. [FAT-351, DEC-V4-31]"""
+    if not vertices or len(vertices) < 2:
+        return None
+    pontos = ", ".join(f"{lon:.6f} {lat:.6f}" for lat, lon in vertices)
+    return f"LINESTRING({pontos})"
+
+
 def registrar_cerca_central(conn, registro: Dict, execucao_id: str) -> None:
     """
     Insere `registro` (mesmo formato usado por `salvar_no_historico`) como
-    ATIVO na base central. [FAT-181, FAT-183]
+    ATIVO na base central, já com `geometria_wkt` do polígono com buffer
+    (fluxo direto CLI/GUI não passa pelo UPDATE da API). [FAT-181, FAT-183,
+    FAT-351]
     """
     vertices = registro.get("vertices", [])
     v_ini = f"{vertices[0][0]:.6f},{vertices[0][1]:.6f}" if vertices else ""
     v_fim = f"{vertices[-1][0]:.6f},{vertices[-1][1]:.6f}" if vertices else ""
+    via_alt = registro.get("via_alternativa_aceita") or {}
     cursor = conn.cursor()
     cursor.execute(
         "INSERT INTO cercas_central (codigo, tipo, rodovia, cidade, uf, velocidade, "
         "seq, extensao_m, vertice_inicial, vertice_final, num_vertices, data_criacao, "
-        "execucao_id, status) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'ativo')",
+        "execucao_id, status, via_alternativa_original, via_alternativa_way_id, "
+        "via_alternativa_justificativa, via_alternativa_confirmado_por, "
+        "via_alternativa_quando, geometria_wkt) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, "
+        "%s, %s, %s, %s, %s, 'ativo', %s, %s, %s, %s, %s, %s)",
         (
             registro.get("codigo", ""), registro.get("tipo", ""),
             registro.get("rodovia", ""), registro.get("cidade", ""), registro.get("uf", ""),
             registro.get("velocidade"), registro.get("seq"), registro.get("extensao_m", 0),
             v_ini, v_fim, len(vertices),
             datetime.now().isoformat(timespec="seconds"), execucao_id,
+            via_alt.get("via_original"), via_alt.get("way_id"),
+            via_alt.get("justificativa"), via_alt.get("confirmado_por"), via_alt.get("quando"),
+            _wkt_linestring(vertices),
         ),
     )
     conn.commit()
@@ -1909,6 +2191,13 @@ def main():
                              "incorretamente). Justificativa é obrigatória. Repetível para "
                              "mais de um par. 'Quem confirmou' é o usuário do sistema "
                              "operacional atual. [FAT-186, Bloco B v4]")
+    parser.add_argument("--aceitar-via-alternativa", action="append", default=None,
+                        metavar="CODIGO:WAY_ID:JUSTIFICATIVA",
+                        help="Aceita via alternativa achada perto do início/fim quando a "
+                             "via referenciada não é localizada no OSM dentro de 100 m. "
+                             "CODIGO é o código PRI da linha; WAY_ID vem do erro/relatório. "
+                             "Justificativa obrigatória. Repetível. Nunca aceita "
+                             "automaticamente. [DEC-V4-32]")
 
     args    = parser.parse_args()
     verbose = not args.silencioso
@@ -1932,6 +2221,21 @@ def main():
             "quando": datetime.now().isoformat(timespec="seconds"),
         }
 
+    overrides_via_alternativa: Dict[Tuple[str, str], Dict] = {}
+    for item in (args.aceitar_via_alternativa or []):
+        partes = item.split(":", 2)
+        if len(partes) != 3 or not partes[2].strip():
+            parser.error(
+                "--aceitar-via-alternativa deve ter o formato "
+                "'CODIGO:WAY_ID:justificativa', com justificativa não vazia. [DEC-V4-32]"
+            )
+        codigo_base, way_id, justificativa = partes
+        overrides_via_alternativa[(codigo_base.strip(), way_id.strip())] = {
+            "justificativa": justificativa.strip(),
+            "confirmado_por": getpass.getuser(),
+            "quando": datetime.now().isoformat(timespec="seconds"),
+        }
+
     # ── Bifurcação: modo --batch vs. modo single-cerca (v1.4 inalterado) ──────
     if args.batch:
         if any([args.via, args.polilinha, args.modo, args.inicio, args.fim,
@@ -1945,7 +2249,8 @@ def main():
         if verbose:
             print(f"\n[MÓDULO 1B] Lendo arquivo de lote '{args.batch}'...  [FAT-63]")
         try:
-            n, _registros, _sobreposicoes, bloqueios_sobreposicao = processar_lote(
+            (n, _registros, _sobreposicoes, bloqueios_sobreposicao,
+             pendencias_via_alternativa, _vias_alternativas_aceitas) = processar_lote(
                 args.batch, caminho_saida, verbose=verbose,
                 caminho_relatorio=args.relatorio,
                 max_tentativas=args.retry_tentativas,
@@ -1961,6 +2266,7 @@ def main():
                 motivo_substituicao=args.motivo_substituicao,
                 limiar_sobreposicao=args.limiar_sobreposicao,
                 overrides_sobreposicao=overrides_sobreposicao,
+                overrides_via_alternativa=overrides_via_alternativa,
             )
         except DuplicidadeCodigoCentralError as e:
             print(f"\nBLOQUEIO (Bloco A v4 — duplicidade de CÓDIGO): {e}", file=sys.stderr)
@@ -1986,6 +2292,19 @@ def main():
                       f"--override-sobreposicao '{b['codigo_existente']}:{b['codigo_novo']}:"
                       f"<justificativa>' para resolver. [FAT-186]", file=sys.stderr)
             sys.exit(4)
+
+        if pendencias_via_alternativa:
+            print(f"\nPENDENCIA (DEC-V4-32 — via alternativa não confirmada): "
+                  f"{len(pendencias_via_alternativa)} linha(s) do lote não foram "
+                  f"processadas.", file=sys.stderr)
+            for p in pendencias_via_alternativa:
+                for c in p["candidatos"]:
+                    print(f"  - linha {p['num_linha']} ('{p['via_original']}'): use "
+                          f"--aceitar-via-alternativa "
+                          f"'{p['codigo_base']}:{c['way_id_referencia']}:<justificativa>' "
+                          f"('{c['nome_ou_ref']}', início {c['d_ini']:.0f} m, "
+                          f"fim {c['d_fim']:.0f} m)", file=sys.stderr)
+            sys.exit(5)
 
         if verbose:
             print(f"\n{'='*60}")
@@ -2085,10 +2404,41 @@ def main():
             cache_ttl_s=args.cache_ttl,
         )
         if not polilinha:
-            print("\nERRO: geometria não encontrada no OSM. "
-                  "Use --polilinha para inserir a polilinha manualmente.",
-                  file=sys.stderr)
-            sys.exit(1)
+            codigo_base = _montar_codigo(
+                "PRI", args.rodovia, args.cidade, args.uf, args.velocidade, args.seq
+            )
+            candidatos = buscar_vias_alternativas_osm(
+                inicio, ponto_bbox_fim, args.via, verbose=verbose,
+                max_tentativas=args.retry_tentativas,
+                espera_base_s=args.retry_espera,
+                timeout_s=args.retry_timeout,
+            )
+            escolhido = None
+            for cand in candidatos:
+                chave = (codigo_base, str(cand["way_id_referencia"]))
+                if chave in overrides_via_alternativa:
+                    escolhido = cand
+                    break
+            if escolhido is not None:
+                polilinha = escolhido["coords"]
+                if verbose:
+                    print(f"  ✓ Via alternativa aceita: '{escolhido['nome_ou_ref']}' "
+                          f"(way {escolhido['way_id_referencia']}). [DEC-V4-32]")
+            elif candidatos:
+                print(f"\nERRO: geometria não encontrada no OSM para '{args.via}', mas "
+                      f"{len(candidatos)} via(s) alternativa(s) próxima(s) foram "
+                      f"encontradas:", file=sys.stderr)
+                for c in candidatos:
+                    print(f"  --aceitar-via-alternativa "
+                          f"'{codigo_base}:{c['way_id_referencia']}:<justificativa>'"
+                          f"   # '{c['nome_ou_ref']}', início {c['d_ini']:.0f} m, "
+                          f"fim {c['d_fim']:.0f} m", file=sys.stderr)
+                sys.exit(5)
+            else:
+                print("\nERRO: geometria não encontrada no OSM. "
+                      "Use --polilinha para inserir a polilinha manualmente.",
+                      file=sys.stderr)
+                sys.exit(1)
 
     # ── Módulos 3+4: Recorte e variantes ──────────────────────────────────────
     if verbose:

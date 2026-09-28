@@ -28,6 +28,7 @@ from cercas_v2 import (
     _validar_rodovia,
     avaliar_bloqueio_sobreposicao,
     buscar_geometria_osm,
+    buscar_vias_alternativas_osm,
     consultar_historico,
     detectar_sobreposicao,
     exportar_csv,
@@ -36,12 +37,15 @@ from cercas_v2 import (
     ler_lote,
     parse_coord,
     parse_polilinha_manual,
+    processar_linha_lote,
+    processar_lote,
     registrar_cerca_central,
     salvar_no_historico,
     substituir_cerca_central,
     sugerir_proximo_seq_livre,
     validar_csv,
     verificar_codigo_central,
+    ViaAlternativaPendenteError,
 )
 
 # Polilinha manual: trecho reto N-S próximo a Curitiba (~5,5 km)
@@ -787,3 +791,329 @@ def test_checar_duplicidade_central_sem_duplicata_nao_faz_nada():
     conn = _FakeCentralConn()
     _checar_duplicidade_central(conn, "BR-116", "LUZ", "MG", 60, 1)
     assert conn.rows == []
+
+
+# ── DEC-V4-32: via alternativa no Módulo 2 ───────────────────────────────────
+
+class _RespostaFalsaVias:
+    """Resposta Overpass fake com ways de identidades distintas, para
+    `buscar_vias_alternativas_osm`. `elements` é parametrizável por teste."""
+    status_code = 200
+    def __init__(self, elements):
+        self._elements = elements
+    def raise_for_status(self):
+        pass
+    def json(self):
+        return {"elements": self._elements}
+
+
+def _no(id_, lat, lon):
+    return {"type": "node", "id": id_, "lat": lat, "lon": lon}
+
+def _way(id_, nodes, tags=None):
+    el = {"type": "way", "id": id_, "nodes": nodes}
+    if tags:
+        el["tags"] = tags
+    return el
+
+
+def test_buscar_vias_alternativas_osm_encontra_candidata_dentro_do_limiar(monkeypatch):
+    elements = [
+        _no(1, 0.0, 0.0), _no(2, 0.0, 0.001),
+        _way(100, [1, 2], {"ref": "BR-999"}),
+    ]
+    monkeypatch.setattr(cercas_v2.requests, "post", lambda *a, **k: _RespostaFalsaVias(elements))
+
+    candidatos = buscar_vias_alternativas_osm((0.0, 0.0), (0.0, 0.001), "BR-116", verbose=False)
+    assert len(candidatos) == 1
+    assert candidatos[0]["way_id_referencia"] == 100
+    assert candidatos[0]["nome_ou_ref"] == "BR-999"
+    assert candidatos[0]["d_ini"] < _COSTURA_DIST_MAX_M
+    assert candidatos[0]["d_fim"] < _COSTURA_DIST_MAX_M
+
+
+def test_buscar_vias_alternativas_osm_ignora_candidatas_acima_do_limiar(monkeypatch):
+    elements = [
+        _no(1, 0.01, 0.0), _no(2, 0.01, 0.001),  # ~1.1 km de (0,0) — acima do limiar de 100 m
+        _way(100, [1, 2], {"ref": "BR-999"}),
+    ]
+    monkeypatch.setattr(cercas_v2.requests, "post", lambda *a, **k: _RespostaFalsaVias(elements))
+
+    candidatos = buscar_vias_alternativas_osm((0.0, 0.0), (0.0, 0.001), "BR-116", verbose=False)
+    assert candidatos == []
+
+
+def test_buscar_vias_alternativas_osm_exclui_a_propria_via_buscada(monkeypatch):
+    elements = [
+        _no(1, 0.0, 0.0), _no(2, 0.0, 0.001),
+        _way(100, [1, 2], {"ref": "BR-116"}),  # mesma ref que a via já tentada
+    ]
+    monkeypatch.setattr(cercas_v2.requests, "post", lambda *a, **k: _RespostaFalsaVias(elements))
+
+    candidatos = buscar_vias_alternativas_osm((0.0, 0.0), (0.0, 0.001), "BR-116", verbose=False)
+    assert candidatos == []
+
+
+def test_buscar_vias_alternativas_osm_multiplas_candidatas_ordenadas_por_distancia(monkeypatch):
+    elements = [
+        _no(1, 0.0002, 0.0), _no(2, 0.0002, 0.001),
+        _way(100, [1, 2], {"ref": "BR-AAA"}),   # mais longe
+        _no(3, 0.00005, 0.0), _no(4, 0.00005, 0.001),
+        _way(200, [3, 4], {"ref": "BR-BBB"}),   # mais perto
+    ]
+    monkeypatch.setattr(cercas_v2.requests, "post", lambda *a, **k: _RespostaFalsaVias(elements))
+
+    candidatos = buscar_vias_alternativas_osm((0.0, 0.0), (0.0, 0.001), "BR-116", verbose=False)
+    assert [c["nome_ou_ref"] for c in candidatos] == ["BR-BBB", "BR-AAA"]
+    assert candidatos[0]["d_ini"] + candidatos[0]["d_fim"] < candidatos[1]["d_ini"] + candidatos[1]["d_fim"]
+
+
+def test_buscar_vias_alternativas_osm_nao_costura_ways_sem_nome_entre_si(monkeypatch):
+    # Dois ways sem ref/name, compartilhando o nó 2 — costurariam juntos se
+    # aplicássemos _costura_ways sobre o conjunto bruto; devem virar
+    # candidatas SEPARADAS (agrupamento por way individual). [DEC-V4-32]
+    elements = [
+        _no(1, 0.0, 0.0), _no(2, 0.0, 0.0005), _no(3, 0.0, 0.001),
+        _way(100, [1, 2]),
+        _way(200, [2, 3]),
+    ]
+    monkeypatch.setattr(cercas_v2.requests, "post", lambda *a, **k: _RespostaFalsaVias(elements))
+
+    candidatos = buscar_vias_alternativas_osm((0.0, 0.0), (0.0, 0.001), "BR-116", verbose=False)
+    way_ids = {c["way_id_referencia"] for c in candidatos}
+    assert way_ids == {100, 200}
+
+
+# ── DEC-V4-32: processar_linha_lote / processar_lote — pendência de via alternativa ──
+
+def _row_lote(via, rodovia, seq, inicio=_INICIO, fim=_FIM, num_linha="1"):
+    return {
+        "via": via, "polilinha": "", "modo": "A",
+        "inicio": f"{inicio[0]},{inicio[1]}", "fim": f"{fim[0]},{fim[1]}",
+        "comprimento": "", "pre": "0", "pos": "0", "buffer": "50",
+        "rodovia": rodovia, "cidade": "LUZ", "uf": "MG", "velocidade": "60",
+        "seq": str(seq), "_num_linha": num_linha,
+    }
+
+
+def test_processar_linha_lote_via_alternativa_aceita_via_override(monkeypatch):
+    monkeypatch.setattr(cercas_v2, "buscar_geometria_osm", lambda *a, **k: None)
+    monkeypatch.setattr(
+        cercas_v2, "buscar_vias_alternativas_osm",
+        lambda *a, **k: [{"way_id_referencia": 555, "nome_ou_ref": "BR-888",
+                           "d_ini": 10.0, "d_fim": 15.0, "coords": _POLY}],
+    )
+    row = _row_lote("BR-999", "BR-999", seq=1)
+    codigo_base = _montar_codigo("PRI", "BR-999", "LUZ", "MG", 60, 1)
+    overrides = {
+        (codigo_base, "555"): {
+            "justificativa": "conferido no mapa OSM", "confirmado_por": "caueh.rebello",
+            "quando": "2026-09-28T10:00:00",
+        },
+    }
+
+    linhas_sascar, registros, via_alt = processar_linha_lote(
+        row, verbose=False, overrides_via_alternativa=overrides,
+    )
+    assert linhas_sascar
+    assert via_alt["way_id"] == 555
+    assert via_alt["justificativa"] == "conferido no mapa OSM"
+    assert registros[0]["via_alternativa_aceita"]["nome_ou_ref"] == "BR-888"
+
+
+def test_processar_linha_lote_via_alternativa_pendente_sem_override_levanta_erro(monkeypatch):
+    monkeypatch.setattr(cercas_v2, "buscar_geometria_osm", lambda *a, **k: None)
+    monkeypatch.setattr(
+        cercas_v2, "buscar_vias_alternativas_osm",
+        lambda *a, **k: [{"way_id_referencia": 555, "nome_ou_ref": "BR-888",
+                           "d_ini": 10.0, "d_fim": 15.0, "coords": _POLY}],
+    )
+    row = _row_lote("BR-999", "BR-999", seq=1)
+
+    with pytest.raises(ViaAlternativaPendenteError) as exc:
+        processar_linha_lote(row, verbose=False)
+    assert "--aceitar-via-alternativa" in str(exc.value)
+    assert "555" in str(exc.value)
+
+
+def test_processar_linha_lote_sem_geometria_e_sem_candidata_levanta_runtime_error_comum(monkeypatch):
+    monkeypatch.setattr(cercas_v2, "buscar_geometria_osm", lambda *a, **k: None)
+    monkeypatch.setattr(cercas_v2, "buscar_vias_alternativas_osm", lambda *a, **k: [])
+    row = _row_lote("BR-999", "BR-999", seq=1)
+
+    with pytest.raises(RuntimeError) as exc:
+        processar_linha_lote(row, verbose=False)
+    assert not isinstance(exc.value, ViaAlternativaPendenteError)
+    assert "Nenhuma via alternativa" in str(exc.value)
+
+
+def test_processar_lote_pendencia_via_alternativa_nao_aborta_demais_linhas(monkeypatch, tmp_path):
+    def fake_geometria(via, *a, **k):
+        return None if via == "BR-999" else _POLY
+    monkeypatch.setattr(cercas_v2, "buscar_geometria_osm", fake_geometria)
+    monkeypatch.setattr(
+        cercas_v2, "buscar_vias_alternativas_osm",
+        lambda *a, **k: [{"way_id_referencia": 777, "nome_ou_ref": "BR-777",
+                           "d_ini": 5.0, "d_fim": 5.0, "coords": _POLY}],
+    )
+    caminho_entrada = _escrever_lote(
+        'BR-999,,A,"-25.38,-49.19","-25.41,-49.19",,0,0,50,BR-999,LUZ,MG,60,1\n'
+        'BR-116,,A,"-25.38,-49.19","-25.41,-49.19",,0,0,50,BR-116,LUZ,MG,60,2\n'
+    )
+    caminho_saida = str(tmp_path / "saida.csv")
+    try:
+        (total, registros, sobreposicoes, bloqueios,
+         pendencias, aceitas) = processar_lote(caminho_entrada, caminho_saida, verbose=False)
+        assert len(pendencias) == 1
+        assert pendencias[0]["via_original"] == "BR-999"
+        assert all(r["rodovia"] == "BR-116" for r in registros)
+        assert total > 0
+    finally:
+        os.unlink(caminho_entrada)
+
+
+def test_processar_lote_outro_erro_de_linha_continua_abortando_tudo(monkeypatch, tmp_path):
+    monkeypatch.setattr(cercas_v2, "buscar_geometria_osm", lambda *a, **k: _POLY)
+    caminho_entrada = _escrever_lote(
+        'BR-116,,A,"-25.38,-49.19",,,0,0,50,BR-116,LUZ,MG,60,1\n'  # modo A sem 'fim' — ValueError
+        'BR-116,,A,"-25.38,-49.19","-25.41,-49.19",,0,0,50,BR-116,LUZ,MG,60,2\n'
+    )
+    caminho_saida = str(tmp_path / "saida.csv")
+    try:
+        with pytest.raises(ValueError, match="modo A requer"):
+            processar_lote(caminho_entrada, caminho_saida, verbose=False)
+        assert not os.path.exists(caminho_saida)  # tudo-ou-nada preservado (R6/R2)
+    finally:
+        os.unlink(caminho_entrada)
+
+
+def test_gerar_relatorio_secao_pendencias_via_alternativa():
+    pendencias = [{
+        "num_linha": "1", "codigo_base": "PRI - BR-999 - LUZ_MG - 60 KmH - 001",
+        "via_original": "BR-999",
+        "candidatos": [{"way_id_referencia": 777, "nome_ou_ref": "BR-777",
+                         "d_ini": 5.0, "d_fim": 5.0}],
+    }]
+    with tempfile.NamedTemporaryFile(suffix=".csv", delete=False, mode="w") as f:
+        caminho = f.name
+    try:
+        gerar_relatorio([], caminho, pendencias_via_alternativa=pendencias, verbose=False)
+        with open(caminho, encoding="utf-8") as f:
+            conteudo = f.read()
+        assert "PENDENCIA DE VIA ALTERNATIVA" in conteudo
+        assert "--aceitar-via-alternativa" in conteudo
+        assert "777" in conteudo
+    finally:
+        os.unlink(caminho)
+
+
+def test_gerar_relatorio_secao_vias_alternativas_aceitas():
+    aceitas = [{
+        "codigo_base": "PRI - BR-999 - LUZ_MG - 60 KmH - 001", "via_original": "BR-999",
+        "way_id": 777, "nome_ou_ref": "BR-777", "justificativa": "conferido no mapa",
+        "confirmado_por": "caueh.rebello", "quando": "2026-09-28T10:00:00",
+    }]
+    with tempfile.NamedTemporaryFile(suffix=".csv", delete=False, mode="w") as f:
+        caminho = f.name
+    try:
+        gerar_relatorio([], caminho, vias_alternativas_aceitas=aceitas, verbose=False)
+        with open(caminho, encoding="utf-8") as f:
+            conteudo = f.read()
+        assert "VIA ALTERNATIVA ACEITA" in conteudo
+        assert "conferido no mapa" in conteudo and "caueh.rebello" in conteudo
+    finally:
+        os.unlink(caminho)
+
+
+def test_registrar_cerca_central_grava_via_alternativa_aceita():
+    conn = _FakeCentralConn()
+    registro = _registro_central(seq=1)
+    registro["via_alternativa_aceita"] = {
+        "via_original": "BR-999", "way_id": 777, "nome_ou_ref": "BR-777",
+        "justificativa": "conferido no mapa", "confirmado_por": "caueh.rebello",
+        "quando": "2026-09-28T10:00:00",
+    }
+    registrar_cerca_central(conn, registro, execucao_id="x")
+    assert conn.rows[0]["via_alternativa_original"] == "BR-999"
+    assert conn.rows[0]["via_alternativa_way_id"] == 777
+    assert conn.rows[0]["via_alternativa_justificativa"] == "conferido no mapa"
+
+
+def test_registrar_cerca_central_sem_via_alternativa_grava_none():
+    conn = _FakeCentralConn()
+    registrar_cerca_central(conn, _registro_central(seq=1), execucao_id="x")
+    assert conn.rows[0]["via_alternativa_original"] is None
+    assert conn.rows[0]["via_alternativa_way_id"] is None
+
+
+# ── FAT-351 / DEC-V4-31: fluxo direto (CLI/GUI) grava geometria_wkt no INSERT ──
+
+def test_registrar_cerca_central_grava_geometria_wkt_linestring():
+    conn = _FakeCentralConn()
+    registrar_cerca_central(conn, _registro_central(seq=1), execucao_id="x")
+    assert conn.rows[0]["geometria_wkt"] == (
+        "LINESTRING(-49.000000 -25.000000, -49.100000 -25.100000)"
+    )
+
+
+def test_registrar_cerca_central_sem_vertices_grava_geometria_wkt_none():
+    conn = _FakeCentralConn()
+    registro = _registro_central(seq=1)
+    registro["vertices"] = []
+    registrar_cerca_central(conn, registro, execucao_id="x")
+    assert conn.rows[0]["geometria_wkt"] is None
+
+
+def test_registrar_cerca_central_geometria_wkt_e_poligono_com_buffer_nao_linha_crua():
+    """geometria_wkt vem dos vértices do polígono com buffer (Módulo 4), nunca
+    da polilinha crua da via — evita reintroduzir a inconsistência
+    polígono-vs-linha do backfill."""
+    cercas = gerar_cercas(_POLY, "A", _INICIO, _FIM, None, pre_m=0, pos_m=0,
+                          buffer_m=50, verbose=False)
+    vertices_poligono = cercas["PRI"]["vertices"]
+    registro = _registro_central(seq=1)
+    registro["vertices"] = vertices_poligono
+    conn = _FakeCentralConn()
+    registrar_cerca_central(conn, registro, execucao_id="x")
+
+    wkt = conn.rows[0]["geometria_wkt"]
+    pontos = wkt[len("LINESTRING("):-1].split(", ")
+    assert len(pontos) == len(vertices_poligono)
+    # nenhum vértice do polígono coincide com a linha crua da via (buffer 50 m)
+    linha_crua = {f"{lon:.6f} {lat:.6f}" for lat, lon in _POLY}
+    assert not linha_crua.intersection(pontos)
+
+
+def test_registrar_cerca_central_geometria_wkt_identica_ao_caminho_da_api():
+    """Paridade com o caminho de referência (`api_cercas._gravar_geometria_wkt`)."""
+    import api_cercas
+    cercas = gerar_cercas(_POLY, "A", _INICIO, _FIM, None, pre_m=100, pos_m=100,
+                          buffer_m=50, verbose=False)
+    for tipo in ("PRI", "PRE"):
+        vertices = cercas[tipo]["vertices"]
+        registro = _registro_central(seq=1)
+        registro["vertices"] = vertices
+        conn = _FakeCentralConn()
+        registrar_cerca_central(conn, registro, execucao_id="x")
+        assert conn.rows[0]["geometria_wkt"] == api_cercas._wkt_linestring(vertices)
+
+
+def test_processar_lote_fluxo_direto_grava_geometria_wkt_na_base_central(monkeypatch, tmp_path):
+    monkeypatch.setattr(cercas_v2, "buscar_geometria_osm", lambda *a, **k: _POLY)
+    conn = _FakeCentralConn()
+    monkeypatch.setattr(cercas_v2, "_obter_conexao_central", lambda *a, **k: conn)
+    caminho_entrada = _escrever_lote(
+        'BR-116,,A,"-25.38,-49.19","-25.41,-49.19",,0,0,50,BR-116,LUZ,MG,60,1\n'
+    )
+    caminho_saida = str(tmp_path / "saida.csv")
+    try:
+        _, registros, *_ = processar_lote(caminho_entrada, caminho_saida,
+                                          verbose=False, pg_fake=True)
+        assert conn.rows
+        por_codigo = {r["codigo"]: r for r in registros}
+        for row in conn.rows:
+            assert row["geometria_wkt"].startswith("LINESTRING(")
+            esperado = cercas_v2._wkt_linestring(por_codigo[row["codigo"]]["vertices"])
+            assert row["geometria_wkt"] == esperado
+    finally:
+        os.unlink(caminho_entrada)
