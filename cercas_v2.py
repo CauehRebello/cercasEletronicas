@@ -222,6 +222,9 @@ OVERPASS_TIMEOUT = 30
 # padrão (50 m). Acima disso, a via encontrada não é a pedida.  [FAT-68, DEC-6]
 _COSTURA_DIST_MAX_M = 100.0
 
+OSRM_URL = "https://router.project-osrm.org"
+_OSRM_LIMIAR_NOMEADO = 0.95  # % mínimo da rota em vias nomeadas  [DEC-V4-33]
+
 # Limiar de bloqueio de sobreposição geométrica (Bloco B v4, Módulo 7).
 # Definido aqui (constantes de módulo) para estar disponível como valor
 # default de `processar_lote` mais abaixo. PROVISÓRIO, sem validação
@@ -666,6 +669,132 @@ out body;
     return candidatos[:limite_candidatos]
 
 
+def _consultar_rota_osrm(
+    ponto_inicio: Tuple[float, float],
+    ponto_fim: Tuple[float, float],
+    timeout_s: int = 10,
+) -> Optional[dict]:
+    """GET no OSRM público (demo); retorna `routes[0]` ou `None` em qualquer
+    falha (rede/timeout/HTTP != 200/JSON malformado). Nunca levanta exceção.
+    [DEC-V4-34]
+    """
+    lat1, lon1 = ponto_inicio
+    lat2, lon2 = ponto_fim
+    url = f"{OSRM_URL}/route/v1/driving/{lon1},{lat1};{lon2},{lat2}"
+    try:
+        resp = requests.get(
+            url,
+            params={"steps": "true", "overview": "full", "geometries": "geojson"},
+            timeout=timeout_s,
+        )
+        if resp.status_code != 200:
+            return None
+        return resp.json()["routes"][0]
+    except Exception:
+        return None
+
+
+def _pct_nomeado_rota(route: dict) -> float:
+    """% da distância da rota OSRM em steps com `name` não vazio.  [DEC-V4-33]"""
+    steps = [s for leg in route["legs"] for s in leg["steps"]]
+    dist_total = sum(s["distance"] for s in steps) or 1.0
+    dist_nomeada = sum(s["distance"] for s in steps if s.get("name"))
+    return dist_nomeada / dist_total
+
+
+def _validar_rota_osrm(
+    ponto_inicio: Tuple[float, float],
+    ponto_fim: Tuple[float, float],
+    verbose: bool = True,
+    timeout_s: int = 10,
+    max_tentativas: int = 3,
+    espera_base_s: float = 3.0,
+    overpass_timeout_s: int = OVERPASS_TIMEOUT,
+) -> Optional[List[Tuple[float, float]]]:
+    """Se a rota OSRM entre os pontos for ≥95% em vias nomeadas [DEC-V4-33],
+    busca os ways físicos correspondentes no Overpass (por nome OU ref) e
+    costura com `_costura_ways`. Retorna coords prontas para `gerar_cercas`,
+    ou `None` em qualquer caso degenerado (rede, % abaixo do limiar, sem
+    nomes/refs, Overpass falhou, costura descontínua) — nunca levanta
+    exceção; nesse caso o chamador cai no comportamento herdado
+    (DEC-V4-32).  [DEC-V4-34]
+    """
+    route = _consultar_rota_osrm(ponto_inicio, ponto_fim, timeout_s=timeout_s)
+    if route is None:
+        return None
+
+    pct = _pct_nomeado_rota(route)
+    if verbose:
+        print(f"  → OSRM: rota com {pct:.0%} em vias nomeadas.")
+    if pct < _OSRM_LIMIAR_NOMEADO:
+        return None
+
+    steps = [s for leg in route["legs"] for s in leg["steps"]]
+    nomes = {s["name"] for s in steps if s.get("name")}
+    refs = {s["ref"] for s in steps if s.get("ref")}
+    if not nomes and not refs:
+        return None
+
+    # bbox de toda a geometria da rota (não só início/fim); geometry.coordinates
+    # é [lon, lat]. Mesma margem de buscar_vias_alternativas_osm.
+    coords_rota = route["geometry"]["coordinates"]
+    lats = [c[1] for c in coords_rota]
+    lons = [c[0] for c in coords_rota]
+    bbox = f"{min(lats)-0.2},{min(lons)-0.2},{max(lats)+0.2},{max(lons)+0.2}"
+
+    filtros = []
+    if nomes:
+        padrao = "|".join(re.escape(n) for n in nomes)
+        filtros.append(f'way["highway"]({bbox})["name"~"^({padrao})$"];')
+    if refs:
+        padrao = "|".join(re.escape(r) for r in refs)
+        filtros.append(f'way["highway"]({bbox})["ref"~"^({padrao})$"];')
+
+    query = f"""
+[out:json][timeout:{overpass_timeout_s}];
+({''.join(filtros)});
+(._;>;);
+out body;
+"""
+    try:
+        dados = _overpass_query(
+            query, max_tentativas=max_tentativas,
+            espera_base_s=espera_base_s, timeout_s=overpass_timeout_s,
+        )
+    except Exception as e:
+        if verbose:
+            print(f"  ⚠  OSRM aceitou a rota, mas Overpass falhou ao buscar ways: {e}")
+        return None
+
+    nodes: dict = {}
+    ways: list = []
+    for el in dados.get("elements", []):
+        if el["type"] == "node":
+            nodes[el["id"]] = (el["lat"], el["lon"])
+        elif el["type"] == "way":
+            ways.append(el)
+    if not ways:
+        return None
+
+    # Diferente de buscar_vias_alternativas_osm: aqui os ways já vêm
+    # filtrados pelos nomes/refs da MESMA rota OSRM, então costurar o
+    # conjunto bruto (sem agrupar por identidade) é seguro.
+    sequencias = _costura_ways(ways, nodes)
+    if not sequencias:
+        return None
+
+    coords, d_ini, d_fim = _selecionar_componente_mais_proximo(
+        sequencias, nodes, ponto_inicio, ponto_fim
+    )
+    if d_ini > _COSTURA_DIST_MAX_M or d_fim > _COSTURA_DIST_MAX_M:
+        return None  # costura descontínua/anômala — caso degenerado
+
+    if verbose:
+        identificadores = sorted(nomes | refs)
+        print(f"  ✓ OSRM/Overpass: via aceita automaticamente ({', '.join(identificadores)}).")
+    return coords
+
+
 class ViaAlternativaPendenteError(RuntimeError):
     """Via referenciada não encontrada, mas há via(s) alternativa(s) perto do
     início/fim ainda não confirmadas via --aceitar-via-alternativa.
@@ -1019,6 +1148,7 @@ def processar_linha_lote(
     max_tentativas: int = 3,
     espera_base_s: float = 3.0,
     timeout_s: int = OVERPASS_TIMEOUT,
+    osrm_timeout_s: int = 10,
     usar_cache: bool = False,
     cache_ttl_s: float = 86400,
     pg_conn=None,
@@ -1045,6 +1175,9 @@ def processar_linha_lote(
     `max_tentativas`, `espera_base_s` e `timeout_s` são repassados a
     `buscar_geometria_osm` (padrões idênticos ao comportamento anterior).  [FAT-119, S7]
     `usar_cache`/`cache_ttl_s` idem, para o cache local de geometrias.  [FAT-154, S4]
+    `osrm_timeout_s` é o timeout (s) da chamada ao OSRM em `_validar_rota_osrm`,
+    tentada quando `buscar_geometria_osm` falha e antes do fallback de via
+    alternativa.  [DEC-V4-34]
 
     `pg_conn` (Bloco A v4, [FAT-181, FAT-182]): se informado (conexão já
     aberta com a base central), checa duplicidade de CÓDIGO ANTES de buscar
@@ -1099,7 +1232,16 @@ def processar_linha_lote(
             max_tentativas=max_tentativas, espera_base_s=espera_base_s, timeout_s=timeout_s,
             usar_cache=usar_cache, cache_ttl_s=cache_ttl_s,
         )
-        if not polilinha:
+
+        if not polilinha:                              # DEC-V4-34
+            polilinha = _validar_rota_osrm(
+                inicio, ponto_bbox_fim, verbose=verbose,
+                timeout_s=osrm_timeout_s,
+                max_tentativas=max_tentativas, espera_base_s=espera_base_s,
+                overpass_timeout_s=timeout_s,
+            )
+
+        if not polilinha:                              # DEC-V4-32 (herdado)
             codigo_base = _montar_codigo(
                 "PRI", row["rodovia"], row["cidade"], row["uf"], int(row["velocidade"]), seq
             )

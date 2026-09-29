@@ -26,6 +26,7 @@ from cercas_v2 import (
     _overpass_query,
     _utm_epsg,
     _validar_rodovia,
+    _validar_rota_osrm,
     avaliar_bloqueio_sobreposicao,
     buscar_geometria_osm,
     buscar_vias_alternativas_osm,
@@ -898,6 +899,7 @@ def _row_lote(via, rodovia, seq, inicio=_INICIO, fim=_FIM, num_linha="1"):
 
 def test_processar_linha_lote_via_alternativa_aceita_via_override(monkeypatch):
     monkeypatch.setattr(cercas_v2, "buscar_geometria_osm", lambda *a, **k: None)
+    monkeypatch.setattr(cercas_v2, "_validar_rota_osrm", lambda *a, **k: None)
     monkeypatch.setattr(
         cercas_v2, "buscar_vias_alternativas_osm",
         lambda *a, **k: [{"way_id_referencia": 555, "nome_ou_ref": "BR-888",
@@ -923,6 +925,7 @@ def test_processar_linha_lote_via_alternativa_aceita_via_override(monkeypatch):
 
 def test_processar_linha_lote_via_alternativa_pendente_sem_override_levanta_erro(monkeypatch):
     monkeypatch.setattr(cercas_v2, "buscar_geometria_osm", lambda *a, **k: None)
+    monkeypatch.setattr(cercas_v2, "_validar_rota_osrm", lambda *a, **k: None)
     monkeypatch.setattr(
         cercas_v2, "buscar_vias_alternativas_osm",
         lambda *a, **k: [{"way_id_referencia": 555, "nome_ou_ref": "BR-888",
@@ -938,6 +941,7 @@ def test_processar_linha_lote_via_alternativa_pendente_sem_override_levanta_erro
 
 def test_processar_linha_lote_sem_geometria_e_sem_candidata_levanta_runtime_error_comum(monkeypatch):
     monkeypatch.setattr(cercas_v2, "buscar_geometria_osm", lambda *a, **k: None)
+    monkeypatch.setattr(cercas_v2, "_validar_rota_osrm", lambda *a, **k: None)
     monkeypatch.setattr(cercas_v2, "buscar_vias_alternativas_osm", lambda *a, **k: [])
     row = _row_lote("BR-999", "BR-999", seq=1)
 
@@ -951,6 +955,7 @@ def test_processar_lote_pendencia_via_alternativa_nao_aborta_demais_linhas(monke
     def fake_geometria(via, *a, **k):
         return None if via == "BR-999" else _POLY
     monkeypatch.setattr(cercas_v2, "buscar_geometria_osm", fake_geometria)
+    monkeypatch.setattr(cercas_v2, "_validar_rota_osrm", lambda *a, **k: None)
     monkeypatch.setattr(
         cercas_v2, "buscar_vias_alternativas_osm",
         lambda *a, **k: [{"way_id_referencia": 777, "nome_ou_ref": "BR-777",
@@ -985,6 +990,80 @@ def test_processar_lote_outro_erro_de_linha_continua_abortando_tudo(monkeypatch,
         assert not os.path.exists(caminho_saida)  # tudo-ou-nada preservado (R6/R2)
     finally:
         os.unlink(caminho_entrada)
+
+
+# ── DEC-V4-34: validação de rota OSRM no Módulo 2 ────────────────────────────
+
+def _osrm_route(steps, geometry_coords):
+    return {"routes": [{"legs": [{"steps": steps}], "geometry": {"coordinates": geometry_coords}}]}
+
+
+class _RespostaFalsaOSRM:
+    def __init__(self, status_code=200, payload=None):
+        self.status_code = status_code
+        self._payload = payload
+    def json(self):
+        return self._payload
+
+
+def test_validar_rota_osrm_aceita_rota_acima_do_limiar_mesmo_com_nome_diferente_do_via(monkeypatch):
+    rota = _osrm_route(
+        steps=[{"name": "Rua das Flores", "distance": 1000.0}],
+        geometry_coords=[[-49.19, -25.38], [-49.19, -25.41]],  # [lon, lat]
+    )
+    monkeypatch.setattr(cercas_v2.requests, "get", lambda *a, **k: _RespostaFalsaOSRM(200, rota))
+
+    elements = [
+        _no(1, -25.38, -49.19), _no(2, -25.41, -49.19),
+        _way(100, [1, 2], {"name": "Rua das Flores"}),
+    ]
+    monkeypatch.setattr(cercas_v2.requests, "post", lambda *a, **k: _RespostaFalsaVias(elements))
+
+    coords = _validar_rota_osrm(_INICIO, _FIM, verbose=False)
+    assert coords
+
+    # Integração: cai no caminho automático, sem pendência de via alternativa.
+    monkeypatch.setattr(cercas_v2, "buscar_geometria_osm", lambda *a, **k: None)
+    row = _row_lote("BR-999", "BR-999", seq=1)
+    linhas_sascar, registros, via_alt = processar_linha_lote(row, verbose=False)
+    assert linhas_sascar
+    assert via_alt is None
+
+
+def test_validar_rota_osrm_abaixo_do_limiar_cai_no_herdado(monkeypatch):
+    rota = _osrm_route(
+        steps=[
+            {"name": "Rua das Flores", "distance": 400.0},
+            {"name": "", "distance": 600.0},
+        ],
+        geometry_coords=[[-49.19, -25.38], [-49.19, -25.41]],
+    )
+    monkeypatch.setattr(cercas_v2.requests, "get", lambda *a, **k: _RespostaFalsaOSRM(200, rota))
+    # Não mockar requests.post: se _validar_rota_osrm chegar a consultar o
+    # Overpass, o teste falha por não haver resposta fake configurada.
+
+    assert _validar_rota_osrm(_INICIO, _FIM, verbose=False) is None
+
+    # Integração: sem OSRM válido, mantém o fallback de via alternativa.
+    monkeypatch.setattr(cercas_v2, "buscar_geometria_osm", lambda *a, **k: None)
+    monkeypatch.setattr(
+        cercas_v2, "buscar_vias_alternativas_osm",
+        lambda *a, **k: [{"way_id_referencia": 555, "nome_ou_ref": "BR-888",
+                           "d_ini": 10.0, "d_fim": 15.0, "coords": _POLY}],
+    )
+    row = _row_lote("BR-999", "BR-999", seq=1)
+    with pytest.raises(ViaAlternativaPendenteError):
+        processar_linha_lote(row, verbose=False)
+
+
+def test_validar_rota_osrm_falha_de_rede_cai_no_herdado_sem_excecao(monkeypatch):
+    def _levanta_timeout(*a, **k):
+        raise requests.exceptions.Timeout()
+    monkeypatch.setattr(cercas_v2.requests, "get", _levanta_timeout)
+    assert _validar_rota_osrm(_INICIO, _FIM, verbose=False) is None
+
+    monkeypatch.setattr(cercas_v2.requests, "get", lambda *a, **k: _RespostaFalsaOSRM(500, None))
+    assert _validar_rota_osrm(_INICIO, _FIM, verbose=False) is None
 
 
 def test_gerar_relatorio_secao_pendencias_via_alternativa():
